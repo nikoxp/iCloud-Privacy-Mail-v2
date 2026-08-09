@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"icloud-privacy-mail-v2/internal/buildinfo"
 	"icloud-privacy-mail-v2/internal/config"
 	"icloud-privacy-mail-v2/internal/httpapi"
 	"icloud-privacy-mail-v2/internal/store"
@@ -80,7 +81,8 @@ func runServer(options launchOptions, logger *slog.Logger) error {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	logger.Info("iCloud Privacy Mail v2 已启动", "地址", "http://"+server.Addr, "配置", options.ConfigPath, "数据", cfg.DataPath)
+	current := buildinfo.Current()
+	logger.Info("iCloud Privacy Mail v2 已启动", "地址", "http://"+server.Addr, "版本", current.Version, "提交", current.Commit, "配置", options.ConfigPath, "数据", cfg.DataPath)
 	err = server.ListenAndServe()
 	if err == http.ErrServerClosed {
 		return nil

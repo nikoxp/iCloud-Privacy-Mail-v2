@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"icloud-privacy-mail-v2/internal/buildinfo"
 	"icloud-privacy-mail-v2/internal/domain"
 	mailboxservice "icloud-privacy-mail-v2/internal/mailbox"
 	"icloud-privacy-mail-v2/internal/scheduler"
@@ -20,6 +21,7 @@ import (
 const publicCodePageContextKey contextKey = "public-code-page"
 
 func (s *Server) handlePublicHealth(w http.ResponseWriter, r *http.Request) {
+	current := buildinfo.Current()
 	if s.globalAPIKey() != "" && !s.authorizedGlobalAPI(r) {
 		writeError(w, http.StatusUnauthorized, "invalid_api_key", "API Key 错误")
 		return
@@ -35,7 +37,8 @@ func (s *Server) handlePublicHealth(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"data": map[string]any{
 			"service":       "icloud-privacy-mail-v2",
-			"version":       "2.0.0",
+			"version":       current.Version,
+			"commit":        current.Commit,
 			"api_active":    s.store.Settings().EnablePublicMailboxAPI && s.globalAPIKey() != "",
 			"icloud_active": active,
 			"time":          time.Now().Format(time.RFC3339),

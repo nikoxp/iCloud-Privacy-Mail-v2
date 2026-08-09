@@ -12,6 +12,7 @@
 - 单次创建与多账号自动创建，默认生成 `x_1`、`x_2` 等连续标签。
 - 公共取号 API、邮箱独立取码 API、独立公共验证码页面。
 - 运行数据、邮件、邮箱地址和取码 API 本地导出。
+- GitHub Release/默认分支版本检查、侧栏版本展示和顶部公告中心。
 - 单管理员登录保护；无多用户注册和 `/manage` 页面。
 
 ## 快速启动
@@ -62,7 +63,7 @@ Vue 开发地址为 `http://127.0.0.1:5174/`，Go API 地址为 `http://127.0.0.
 | `/mailboxes` | 搜索筛选、详情、邮件、取码、远端清理和删除 |
 | `/tasks` | 创建一个邮箱、自动创建、默认值和调度日志 |
 | `/exports` | 运行数据、邮件、邮箱和 API 导出 |
-| `/settings` | 本地数据、后台能力、公共访问和 API Key |
+| `/settings` | 本地数据、后台能力、公共访问、API Key 和版本检查 |
 | `/verification-code` | 面向外部用户的独立公共验证码页面 |
 
 所有空数据页面截图、逐页操作说明、接口、配置、结构和技术栈见 [完整项目指南](PROJECT_GUIDE.md)。
@@ -111,12 +112,14 @@ iCloud-Privacy-Mail-v2/
 ├── cmd/migrate/             # 旧状态迁移工具
 ├── internal/
 │   ├── auth/                # 单管理员和会话
+│   ├── buildinfo/           # 二进制版本、提交和构建信息
 │   ├── apple/               # Apple 登录态和保活
 │   ├── mailbox/             # 邮箱、邮件、验证码和远端操作
 │   ├── mailwatcher/         # IMAP IDLE 和批量同步
 │   ├── scheduler/           # 自动创建调度
 │   ├── protocol/            # Apple、iCloud、IMAP 协议客户端
 │   ├── store/               # schema 3 JSON 状态存储
+│   ├── updatecheck/         # GitHub 版本检查与项目公告
 │   ├── httpapi/             # 管理 API、公共 API 和导出
 │   └── webui/               # Go 嵌入式前端资源
 ├── frontend/                # Vue 3 + Vue Router + Tailwind CSS
@@ -125,6 +128,12 @@ iCloud-Privacy-Mail-v2/
 ├── PROJECT_GUIDE.md         # 完整使用与技术文档
 └── config.example.json
 ```
+
+## 版本检查与公告
+
+左侧导航底部显示当前版本和构建提交。进入“系统设置 → 版本与更新”可以检查 `update_repository` 对应仓库的最新 GitHub Release；仓库没有 Release 时会比较默认分支的最新提交。顶部铃铛显示版本消息和项目公告，已读状态只保存在当前浏览器。
+
+当前功能只负责检查和打开 GitHub 页面，不会下载或替换正在运行的程序。项目公告维护在 `internal/updatecheck/announcements.json`，远端内容按纯文本显示。完整构建脚本会把版本、Git commit 和构建时间写入二进制；在 Git tag 上构建时使用 tag 作为版本号，也可以通过 `IPM_VERSION` 指定版本。
 
 ## 数据迁移
 

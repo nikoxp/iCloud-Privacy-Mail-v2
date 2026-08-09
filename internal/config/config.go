@@ -52,7 +52,7 @@ func Default() Config {
 		MailWatcherLookbackHours:           24,
 		PublicFastSyncWaitMS:               600,
 		PublicSyncMinIntervalMS:            3000,
-		UpdateEnabled:                      false,
+		UpdateEnabled:                      true,
 		UpdateRepository:                   "xiuxiu56/iCloud-Privacy-Mail-v2",
 	}
 }

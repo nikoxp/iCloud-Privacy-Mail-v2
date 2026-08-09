@@ -1,10 +1,13 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
-import { Database, ExternalLink, Eye, EyeOff, Globe2, KeyRound, LoaderCircle, Save, ShieldCheck, Sparkles } from '@lucide/vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { CalendarClock, CheckCircle2, CircleAlert, Database, ExternalLink, Eye, EyeOff, FolderGit2, GitCommit, Globe2, KeyRound, LoaderCircle, Monitor, PackageOpen, RefreshCw, Save, ShieldCheck, Sparkles } from '@lucide/vue'
+import { useRoute } from 'vue-router'
 import { api } from '../api/client'
 import { useToast } from '../composables/useToast'
+import { useUpdates } from '../composables/useUpdates'
 
 const loading = ref(true)
+const route = useRoute()
 const saving = ref('')
 const dataPath = ref('')
 const runtime = ref({})
@@ -19,6 +22,7 @@ const form = reactive({
   apple_account_module_ready: true,
 })
 const { success, error: showError } = useToast()
+const { updateState, showChecking, loadUpdates } = useUpdates()
 const publicAPIKeyReady = computed(() => Boolean(String(form.public_api_key || '').trim() || runtime.value.config_api_key_configured))
 const publicAPIKeySourceText = computed(() => {
   if (String(form.public_api_key || '').trim()) return '系统设置'
@@ -66,7 +70,46 @@ async function saveSystem() {
   } catch (err) { notify(err.message, true) } finally { saving.value = '' }
 }
 
-onMounted(load)
+function formatDate(value) {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date)
+}
+
+function shortCommit(value) {
+  const commit = String(value || '').trim()
+  if (!commit || commit === 'unknown') return '未写入'
+  return commit.slice(0, 12)
+}
+
+async function checkForUpdates() {
+  try {
+    const status = await loadUpdates(true)
+    if (status?.error) {
+      showError(status.error)
+    } else if (status?.update_available) {
+      success('发现新的项目版本或源码提交')
+    } else {
+      success('检查完成，当前已经是最新版本')
+    }
+  } catch (err) {
+    showError(err.message)
+  }
+}
+
+async function scrollToVersionCard() {
+  if (route.hash !== '#version-updates') return
+  await nextTick()
+  window.setTimeout(() => document.querySelector('#version-updates')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+}
+
+watch(() => route.hash, scrollToVersionCard)
+
+onMounted(async () => {
+  await Promise.allSettled([load(), loadUpdates()])
+  scrollToVersionCard()
+})
 </script>
 
 <template>
@@ -103,6 +146,53 @@ onMounted(load)
         </section>
         <div class="flex justify-end"><button class="primary-button" :disabled="saving === 'system'"><LoaderCircle v-if="saving === 'system'" :size="17" class="animate-spin" /><Save v-else :size="17" />保存系统设置</button></div>
       </form>
+
+      <section id="version-updates" class="panel scroll-mt-20 overflow-hidden">
+        <div class="flex flex-col gap-4 border-b border-slate-100 p-5 dark:border-slate-700 sm:flex-row sm:items-start sm:justify-between sm:p-6">
+          <div class="flex min-w-0 items-start gap-3">
+            <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"><RefreshCw :size="20" /></span>
+            <div class="min-w-0">
+              <h2 class="text-base font-black text-slate-900 dark:text-slate-100">版本与更新</h2>
+              <p class="mt-1 text-xs leading-5 text-slate-400">检查 GitHub Release 和默认分支最新提交；当前只提供查看，不会自动替换本地程序。</p>
+            </div>
+          </div>
+          <div class="flex shrink-0 flex-wrap gap-2">
+            <a v-if="updateState.status?.repository_url" class="secondary-button" :href="updateState.status.repository_url" target="_blank" rel="noopener noreferrer"><FolderGit2 :size="16" />打开仓库</a>
+            <button type="button" class="primary-button" :disabled="updateState.loading || updateState.status?.enabled === false" @click="checkForUpdates">
+              <LoaderCircle v-if="showChecking" :size="17" class="animate-spin" />
+              <RefreshCw v-else :size="17" />
+              {{ showChecking ? '正在检查' : updateState.status?.enabled === false ? '检查更新已关闭' : '检查更新' }}
+            </button>
+          </div>
+        </div>
+
+        <div class="grid gap-px bg-slate-200 dark:bg-slate-700 sm:grid-cols-2 lg:grid-cols-4">
+          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><PackageOpen :size="12" />当前版本</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current?.version || '2.0.0-dev' }}</strong></div>
+          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><GitCommit :size="12" />构建提交</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ shortCommit(updateState.status?.current?.commit) }}</strong></div>
+          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><Monitor :size="12" />运行平台</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current ? `${updateState.status.current.os} / ${updateState.status.current.arch}` : '-' }}</strong></div>
+          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><CalendarClock :size="12" />检查时间</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ formatDate(updateState.status?.checked_at) }}</strong></div>
+        </div>
+
+        <div class="p-5 sm:p-6">
+          <div v-if="updateState.status?.error" class="flex items-start gap-3 rounded-xl border border-rose-200 bg-rose-50 p-4 dark:border-rose-900 dark:bg-rose-950/30">
+            <CircleAlert :size="19" class="mt-0.5 shrink-0 text-rose-500" />
+            <div><strong class="text-sm text-rose-700 dark:text-rose-300">检查更新失败</strong><p class="mt-1 break-words text-xs leading-5 text-rose-600/80 dark:text-rose-300/80">{{ updateState.status.error }}</p></div>
+          </div>
+          <div v-else-if="updateState.status?.latest" :class="updateState.status.update_available ? 'border-amber-200 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/30' : 'border-emerald-200 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/30'" class="flex flex-col gap-4 rounded-xl border p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div class="flex min-w-0 items-start gap-3">
+              <CircleAlert v-if="updateState.status.update_available" :size="19" class="mt-0.5 shrink-0 text-amber-500" />
+              <CheckCircle2 v-else :size="19" class="mt-0.5 shrink-0 text-emerald-500" />
+              <div class="min-w-0">
+                <strong class="block text-sm text-slate-800 dark:text-slate-100">{{ updateState.status.update_available ? '发现新的项目内容' : '当前已经是最新版本' }}</strong>
+                <p class="mt-1 truncate text-xs text-slate-500 dark:text-slate-300">{{ updateState.status.latest.name }}</p>
+                <p v-if="updateState.status.latest.notes" class="mt-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-slate-400">{{ updateState.status.latest.notes }}</p>
+              </div>
+            </div>
+            <a v-if="updateState.status.latest.url" class="secondary-button shrink-0" :href="updateState.status.latest.url" target="_blank" rel="noopener noreferrer"><ExternalLink :size="16" />{{ updateState.status.latest.source === 'release' ? '查看新版本' : '查看提交' }}</a>
+          </div>
+          <div v-else class="rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-400 dark:border-slate-700 dark:bg-slate-900/40">{{ updateState.status?.enabled === false ? '配置文件已关闭更新检查。' : '点击“检查更新”读取 GitHub 最新版本信息。' }}</div>
+        </div>
+      </section>
     </template>
   </div>
 </template>

@@ -1,8 +1,9 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { Activity, Bell, LogOut, Menu, UserCircle } from '@lucide/vue'
+import { Activity, LogOut, Menu, UserCircle } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import Sidebar from '../components/Sidebar.vue'
+import AnnouncementCenter from '../components/AnnouncementCenter.vue'
 import ThemeToggle from '../components/ThemeToggle.vue'
 import { useAuth } from '../composables/useAuth'
 
@@ -52,7 +53,7 @@ onMounted(() => {
         <div class="flex items-center gap-2 sm:gap-4">
           <span class="hidden items-center gap-2 text-xs font-medium text-slate-400 lg:flex"><Activity :size="15" class="text-emerald-500" />本地模式</span>
           <ThemeToggle :dark="dark" class="hidden sm:flex" @toggle="applyTheme(!dark)" />
-          <button class="relative rounded-xl p-2 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800" title="通知"><Bell :size="18" /><span class="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-emerald-500" /></button>
+          <AnnouncementCenter />
           <div class="relative">
             <button class="flex items-center gap-2 rounded-xl p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800" @click="profileOpen = !profileOpen"><UserCircle :size="27" class="text-emerald-500" /><span class="hidden max-w-28 truncate text-xs font-bold sm:block">{{ authState.admin?.username || '管理员' }}</span></button>
             <div v-if="profileOpen" class="absolute right-0 top-12 w-48 rounded-xl border border-slate-200 bg-white p-2 shadow-xl dark:border-slate-700 dark:bg-slate-800">

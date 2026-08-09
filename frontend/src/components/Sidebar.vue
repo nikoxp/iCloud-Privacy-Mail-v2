@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import { Activity, Apple, Boxes, ChevronRight, Cloud, Download, LayoutDashboard, MailPlus, Settings, X } from '@lucide/vue'
 import ThemeToggle from './ThemeToggle.vue'
+import { useUpdates } from '../composables/useUpdates'
 
 const props = defineProps({
   open: Boolean,
@@ -9,6 +10,16 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['close', 'toggle-theme'])
+const { currentVersion, currentCommit } = useUpdates()
+
+const versionText = computed(() => {
+  const value = String(currentVersion.value || '2.0.0-dev').trim()
+  return /^v/i.test(value) ? value : `v${value}`
+})
+const commitText = computed(() => {
+  const value = String(currentCommit.value || '').trim()
+  return value && value !== 'unknown' ? value.slice(0, 7) : ''
+})
 
 const items = [
   { name: 'dashboard', label: '控制台', icon: LayoutDashboard },
@@ -49,7 +60,12 @@ const drawerClass = computed(() => props.open ? 'translate-x-0' : '-translate-x-
 
     <div class="border-t border-slate-100 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/20">
       <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2 text-xs font-medium text-slate-500 dark:text-slate-400"><span class="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />本地服务</div>
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 text-xs font-medium text-slate-500 dark:text-slate-400"><span class="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />本地服务</div>
+          <RouterLink :to="{ name: 'settings', hash: '#version-updates' }" class="mt-2 inline-flex max-w-full items-center gap-1.5 rounded-md text-[10px] font-semibold text-slate-400 transition hover:text-emerald-600 dark:hover:text-emerald-300" :title="`当前版本 ${versionText}${commitText ? `，提交 ${currentCommit}` : ''}`" @click="emit('close')">
+            <span>版本 {{ versionText }}</span><span v-if="commitText" class="font-mono">· {{ commitText }}</span>
+          </RouterLink>
+        </div>
         <ThemeToggle :dark="dark" @toggle="emit('toggle-theme')" />
       </div>
     </div>

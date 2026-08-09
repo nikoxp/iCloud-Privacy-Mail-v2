@@ -15,6 +15,7 @@ import (
 
 	"icloud-privacy-mail-v2/internal/apple"
 	"icloud-privacy-mail-v2/internal/auth"
+	"icloud-privacy-mail-v2/internal/buildinfo"
 	"icloud-privacy-mail-v2/internal/config"
 	"icloud-privacy-mail-v2/internal/domain"
 	mailboxservice "icloud-privacy-mail-v2/internal/mailbox"
@@ -22,6 +23,7 @@ import (
 	"icloud-privacy-mail-v2/internal/protocol"
 	"icloud-privacy-mail-v2/internal/scheduler"
 	"icloud-privacy-mail-v2/internal/store"
+	"icloud-privacy-mail-v2/internal/updatecheck"
 	"icloud-privacy-mail-v2/internal/webui"
 )
 
@@ -38,6 +40,7 @@ type Server struct {
 	mailbox           *mailboxservice.Service
 	scheduler         *scheduler.Service
 	watcher           *mailwatcher.Service
+	updates           *updatecheck.Service
 	log               *slog.Logger
 	mux               *http.ServeMux
 	keepAliveMu       sync.RWMutex
@@ -56,6 +59,7 @@ func New(cfg config.Config, state *store.Store, logger *slog.Logger) *Server {
 		auth:       auth.NewService(state, time.Duration(cfg.SessionTTLHours)*time.Hour),
 		apple:      apple.NewService(cfg, state),
 		mailbox:    mailboxservice.NewService(cfg, state),
+		updates:    updatecheck.New(cfg.UpdateEnabled, cfg.UpdateRepository),
 		log:        logger,
 		mux:        http.NewServeMux(),
 	}
@@ -100,6 +104,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/tasks", s.protected(s.handleTasks))
 	s.mux.HandleFunc("GET /api/settings", s.protected(s.handleSettings))
 	s.mux.HandleFunc("PUT /api/settings", s.protected(s.handleSaveSettings))
+	s.mux.HandleFunc("GET /api/update/status", s.protected(s.handleUpdateStatus))
 	s.mux.HandleFunc("GET /api/create-settings", s.protected(s.handleCreateSettings))
 	s.mux.HandleFunc("PUT /api/create-settings", s.protected(s.handleSaveCreateSettings))
 	s.mux.HandleFunc("GET /api/events", s.protected(s.handleEvents))
@@ -210,11 +215,13 @@ func (s *Server) protected(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	current := buildinfo.Current()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
 		"data": map[string]any{
 			"status":  "ok",
-			"version": "2.0.0-dev",
+			"version": current.Version,
+			"commit":  current.Commit,
 		},
 	})
 }

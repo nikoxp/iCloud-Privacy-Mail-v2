@@ -200,15 +200,18 @@ go run main.go -config config.json -host 127.0.0.1 -port 8788 -data data/state.j
 
 ![系统设置](./docs/screenshots/empty/06-settings.jpg)
 
-系统设置分为三组：
+系统设置包含以下区域：
 
 1. 本地数据：邮箱池每页数量、当前状态文件路径。
 2. 后台能力：IMAP 实时邮件监听、Apple 登录态保活。
 3. 公共访问：公共取号 API、公共验证码页面、公共 API Key。
+4. 版本与更新：当前版本、构建提交、运行平台、检查时间和 GitHub 最新内容。
 
 “生成新 Key”使用浏览器加密随机数生成公共 API Key。系统设置中的 Key 优先于 `config.json` 的备用 `api_key`。公共取号、批量查询和带全局 Key 的邮箱取码需要该 Key；公共验证码页面有独立开关，不读取这个 Key。
 
 页面中的开关只在底层能力由 `config.json` 启用时生效。例如 `mail_watcher_enabled=false` 时，IMAP 后台监听能力保持停用。
+
+左侧导航底部的版本号可以直接跳到“版本与更新”。顶部铃铛是公告中心，默认显示最新 5 条并在内部滚动；点击公告使用带遮罩的详情弹窗。项目公告来自 `internal/updatecheck/announcements.json`，GitHub Release 或新的默认分支提交也会自动生成版本公告。所有远端正文均按纯文本显示。
 
 ### 3.8 公共验证码 `/verification-code`
 
@@ -324,6 +327,7 @@ GET    /api/mailboxes/{id}/code
 GET  /api/tasks
 GET  /api/settings
 PUT  /api/settings
+GET  /api/update/status
 GET  /api/create-settings
 PUT  /api/create-settings
 GET  /api/scheduler/status
@@ -382,7 +386,8 @@ GET  /api/v1/public-code?email={email}
 | `mail_watcher_lookback_hours` | `24` | 首次监听回看小时数 |
 | `public_fast_sync_wait_ms` | `600` | 公共取码快速同步等待时间 |
 | `public_sync_min_interval_ms` | `3000` | 同一邮箱公共同步最短间隔 |
-| `update_enabled` | `false` | 预留配置，当前没有更新接口和页面 |
+| `update_enabled` | `true` | 是否启用 GitHub 版本与项目公告检查 |
+| `update_repository` | `xiuxiu56/iCloud-Privacy-Mail-v2` | 检查 Release、默认分支提交和公告文件的仓库 |
 
 `config.json` 和 `data/` 已加入 `.gitignore`。如果配置文件中写入 API Key，应把文件权限收紧为仅当前用户可读：
 
@@ -423,6 +428,7 @@ iCloud-Privacy-Mail-v2/
 │   └── migrate/main.go             # 旧状态迁移命令
 ├── internal/
 │   ├── auth/service.go             # 单管理员、密码摘要、控制台会话
+│   ├── buildinfo/buildinfo.go      # 二进制版本、提交、构建时间和平台
 │   ├── config/config.go            # 默认配置与 JSON 加载
 │   ├── domain/model.go             # schema 3 领域模型
 │   ├── apple/service.go            # Apple 登录、2FA、检测、IMAP 和保活
@@ -431,6 +437,7 @@ iCloud-Privacy-Mail-v2/
 │   ├── scheduler/service.go        # 自动创建调度与内存日志
 │   ├── protocol/                   # Apple SRP、iCloud、IMAP 协议客户端
 │   ├── store/                      # 并发安全的 JSON 状态存储
+│   ├── updatecheck/                # GitHub Release、提交和公告检查
 │   ├── httpapi/                    # 管理接口、公共接口和导出接口
 │   └── webui/                      # Go embed 前端构建产物
 ├── frontend/
