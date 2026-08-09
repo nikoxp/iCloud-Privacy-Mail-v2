@@ -1,0 +1,313 @@
+package mailwatcher
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"icloud-privacy-mail-v2/internal/config"
+	"icloud-privacy-mail-v2/internal/domain"
+	mailboxservice "icloud-privacy-mail-v2/internal/mailbox"
+	"icloud-privacy-mail-v2/internal/protocol"
+	"icloud-privacy-mail-v2/internal/store"
+)
+
+const (
+	mailWatcherSyncTimeout = 90 * time.Second
+	mailWatcherActiveTTL   = 20 * time.Minute
+)
+
+type Service struct {
+	cfg         config.Config
+	store       *store.Store
+	mailbox     *mailboxservice.Service
+	log         *slog.Logger
+	wake        chan struct{}
+	activeMu    sync.Mutex
+	activeUntil map[string]time.Time
+}
+
+type watchGroup struct {
+	key       string
+	session   domain.ICloudSession
+	state     domain.LoginState
+	mailboxes []domain.Mailbox
+	signature string
+}
+
+type idleWorker struct {
+	cancel    context.CancelFunc
+	signature string
+}
+
+func NewService(cfg config.Config, state *store.Store, mailbox *mailboxservice.Service, logger *slog.Logger) *Service {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Service{
+		cfg:         cfg,
+		store:       state,
+		mailbox:     mailbox,
+		log:         logger,
+		wake:        make(chan struct{}, 1),
+		activeUntil: make(map[string]time.Time),
+	}
+}
+
+func (s *Service) Run(ctx context.Context) {
+	interval := time.Duration(s.cfg.MailWatcherPollMS) * time.Millisecond
+	if interval < time.Second {
+		interval = 3 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	workers := make(map[string]idleWorker)
+	defer stopIdleWorkers(workers)
+	s.log.Info("后台邮件监听已启动", "轮询间隔", interval)
+
+	started := false
+	cycle := func() {
+		enabled := s.cfg.MailWatcherEnabled && s.store.Settings().EnableMailWatcher
+		if !enabled {
+			if started {
+				stopIdleWorkers(workers)
+				started = false
+			}
+			return
+		}
+		if !started {
+			s.syncRound(ctx, true)
+			started = true
+		} else {
+			s.syncRound(ctx, false)
+		}
+		s.ensureIdleWorkers(ctx, workers)
+	}
+	cycle()
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("后台邮件监听已停止")
+			return
+		case <-s.wake:
+			cycle()
+		case <-ticker.C:
+			cycle()
+		}
+	}
+}
+
+// Wake 把主动取码的邮箱提升到本轮同步前面，并立即唤醒监听器。
+func (s *Service) Wake(mailboxID string) {
+	mailboxID = strings.TrimSpace(mailboxID)
+	if mailboxID != "" {
+		s.activeMu.Lock()
+		s.activeUntil[mailboxID] = time.Now().Add(mailWatcherActiveTTL)
+		s.activeMu.Unlock()
+	}
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) syncRound(ctx context.Context, initial bool) {
+	groups := s.groups()
+	if len(groups) == 0 {
+		return
+	}
+	after := time.Time{}
+	limit := s.cfg.MailWatcherFetchLimit
+	if initial {
+		limit = s.cfg.MailWatcherInitialFetchLimit
+		if s.cfg.MailWatcherLookbackHours > 0 {
+			after = time.Now().Add(-time.Duration(s.cfg.MailWatcherLookbackHours) * time.Hour)
+		}
+	}
+	for _, group := range groups {
+		if ctx.Err() != nil {
+			return
+		}
+		syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
+		_, err := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, after, "OpenAI", limit)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			s.log.Warn("后台批量同步邮箱失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "首次同步", initial, "错误", err)
+		}
+	}
+}
+
+func (s *Service) ensureIdleWorkers(ctx context.Context, workers map[string]idleWorker) {
+	groups := s.groups()
+	seen := make(map[string]bool, len(groups))
+	for _, group := range groups {
+		seen[group.key] = true
+		if worker, ok := workers[group.key]; ok && worker.signature == group.signature {
+			continue
+		}
+		if worker, ok := workers[group.key]; ok {
+			worker.cancel()
+			delete(workers, group.key)
+		}
+		if err := s.ensureBaseline(ctx, group); err != nil {
+			s.log.Warn("初始化 IMAP UID 起点失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "错误", err)
+			continue
+		}
+		workerCtx, cancel := context.WithCancel(ctx)
+		workers[group.key] = idleWorker{cancel: cancel, signature: group.signature}
+		go s.runIdleWorker(workerCtx, group)
+	}
+	for key, worker := range workers {
+		if seen[key] {
+			continue
+		}
+		worker.cancel()
+		delete(workers, key)
+	}
+}
+
+func (s *Service) ensureBaseline(ctx context.Context, group watchGroup) error {
+	if strings.TrimSpace(group.state.IMAPLastSyncUID) != "" {
+		return nil
+	}
+	uid, err := protocol.LatestICloudIMAPUID(ctx, group.state)
+	if err != nil || strings.TrimSpace(uid) == "" {
+		return err
+	}
+	group.state.IMAPLastSyncUID = strings.TrimSpace(uid)
+	group.state.IMAPLastSyncAt = time.Now()
+	group.session = protocol.WithLoginState(group.session, group.state)
+	_, err = s.store.SaveICloudSession(group.session)
+	return err
+}
+
+func (s *Service) runIdleWorker(ctx context.Context, group watchGroup) {
+	backoff := time.Second
+	for ctx.Err() == nil {
+		err := protocol.WatchICloudIMAPExists(ctx, group.state, func() {
+			if ctx.Err() != nil {
+				return
+			}
+			syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
+			_, syncErr := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, time.Time{}, "OpenAI", s.cfg.MailWatcherFetchLimit)
+			cancel()
+			if syncErr != nil && ctx.Err() == nil {
+				s.log.Warn("IMAP IDLE 触发同步失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "错误", syncErr)
+			}
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			s.log.Warn("IMAP IDLE 已断开，准备重连", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "等待", backoff, "错误", err)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if backoff < 15*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func (s *Service) groups() []watchGroup {
+	active := s.activeMailboxIDs(time.Now())
+	type bucket struct {
+		session   domain.ICloudSession
+		state     domain.LoginState
+		mailboxes []domain.Mailbox
+	}
+	buckets := make(map[string]*bucket)
+	for _, mailbox := range s.store.AllMailboxes() {
+		if !mailbox.APIActive || !mailbox.ICloudActive || mailbox.Status == domain.StatusDisabled {
+			continue
+		}
+		session, ok := s.store.ICloudSessionByAccountID(mailbox.AccountID)
+		if !ok {
+			continue
+		}
+		imapState, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
+		if !ok || strings.TrimSpace(imapState.IMAPAppPassword) == "" {
+			continue
+		}
+		key := firstNonEmpty(session.AccountID, mailbox.AccountID, mailbox.OwnerID, "__imap__")
+		item := buckets[key]
+		if item == nil {
+			item = &bucket{session: session, state: imapState}
+			buckets[key] = item
+		}
+		item.mailboxes = append(item.mailboxes, mailbox)
+	}
+	keys := make([]string, 0, len(buckets))
+	for key := range buckets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	groups := make([]watchGroup, 0, len(keys))
+	for _, key := range keys {
+		item := buckets[key]
+		sort.Slice(item.mailboxes, func(i, j int) bool {
+			leftActive := active[item.mailboxes[i].ID]
+			rightActive := active[item.mailboxes[j].ID]
+			if leftActive != rightActive {
+				return leftActive
+			}
+			return item.mailboxes[i].Email < item.mailboxes[j].Email
+		})
+		groups = append(groups, watchGroup{
+			key:       key,
+			session:   item.session,
+			state:     item.state,
+			mailboxes: item.mailboxes,
+			signature: groupSignature(item.state, item.mailboxes),
+		})
+	}
+	return groups
+}
+
+func (s *Service) activeMailboxIDs(now time.Time) map[string]bool {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	active := make(map[string]bool)
+	for mailboxID, until := range s.activeUntil {
+		if until.After(now) {
+			active[mailboxID] = true
+			continue
+		}
+		delete(s.activeUntil, mailboxID)
+	}
+	return active
+}
+
+func groupSignature(state domain.LoginState, mailboxes []domain.Mailbox) string {
+	parts := []string{state.IMAPEmail, state.IMAPUsername, state.IMAPHost, fmt.Sprint(state.IMAPPort), state.IMAPAppPassword}
+	for _, mailbox := range mailboxes {
+		parts = append(parts, mailbox.ID, mailbox.Email)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(parts, "|"))))
+}
+
+func stopIdleWorkers(workers map[string]idleWorker) {
+	for key, worker := range workers {
+		worker.cancel()
+		delete(workers, key)
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}

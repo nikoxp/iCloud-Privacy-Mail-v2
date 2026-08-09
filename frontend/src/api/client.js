@@ -1,0 +1,34 @@
+export class ApiError extends Error {
+  constructor(message, status = 0, code = '') {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+  }
+}
+
+export async function api(path, options = {}) {
+  const headers = new Headers(options.headers || {})
+  if (options.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+  const response = await fetch(path, {
+    credentials: 'same-origin',
+    ...options,
+    headers,
+  })
+  let payload = null
+  try {
+    payload = await response.json()
+  } catch {
+    throw new ApiError(`服务器返回了无效响应（HTTP ${response.status}）`, response.status)
+  }
+  if (!response.ok || payload?.success === false) {
+	if (response.status === 401 && path !== '/api/auth/login' && path !== '/api/auth/setup' && !path.startsWith('/api/v1/')) {
+	  const redirect = `${window.location.pathname}${window.location.search}`
+	  window.location.replace(`/login?redirect=${encodeURIComponent(redirect)}`)
+	}
+    throw new ApiError(payload?.message || `请求失败（HTTP ${response.status}）`, response.status, payload?.code || '')
+  }
+  return payload?.data ?? payload
+}
