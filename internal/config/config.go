@@ -53,7 +53,7 @@ func Default() Config {
 		PublicFastSyncWaitMS:               600,
 		PublicSyncMinIntervalMS:            3000,
 		UpdateEnabled:                      false,
-		UpdateRepository:                   "q1953258942/iCloud-Privacy-Mail",
+		UpdateRepository:                   "xiuxiu56/iCloud-Privacy-Mail-v2",
 	}
 }
 
