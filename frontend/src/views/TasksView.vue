@@ -14,7 +14,7 @@ const scheduler = ref({ running: false, status: 'idle', events: [] })
 const accounts = ref([])
 const lastCreatedMailbox = ref(null)
 const form = reactive({ mode: 'once', account_id: '', account_ids: [], label: '', note: '', create_channel: 'auto', interval_minutes: 60, round_interval_seconds: 5 })
-const defaultForm = reactive({ label: '', note: '', account_ids: [], create_channel: 'auto', scheduler_create_channel: 'auto', apple_account_two_factor_method: 'trusted_device', icloud_web_two_factor_method: 'trusted_device', scheduler_interval_minutes: 60, scheduler_round_interval_seconds: 5, mailbox_page_size: 20 })
+const defaultForm = reactive({ label: '', note: '', account_ids: [], create_channel: 'auto', scheduler_create_channel: 'auto', apple_account_two_factor_method: 'trusted_device', icloud_web_two_factor_method: 'trusted_device', scheduler_interval_minutes: 60, scheduler_round_interval_seconds: 5, mailbox_page_size: 7 })
 const { success, error: showError } = useToast()
 const { confirm: confirmAction } = useConfirm()
 
@@ -108,7 +108,7 @@ function assignDefaultSettings(settings = {}) {
     icloud_web_two_factor_method: 'trusted_device',
     scheduler_interval_minutes: 60,
     scheduler_round_interval_seconds: 5,
-    mailbox_page_size: 20,
+    mailbox_page_size: 7,
   }, displaySettings)
 }
 

@@ -43,7 +43,7 @@ func Default() Config {
 		ICloudDefaultHost:                  "www.icloud.com.cn",
 		ICloudClientID:                     "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d",
 		AppleAccountKeepAliveEnabled:       true,
-		AppleAccountKeepAliveMS:            240000,
+		AppleAccountKeepAliveMS:            180000,
 		AppleAccountKeepAliveJitterPercent: 15,
 		MailWatcherEnabled:                 true,
 		MailWatcherPollMS:                  3000,

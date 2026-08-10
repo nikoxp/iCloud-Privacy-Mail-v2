@@ -227,20 +227,8 @@ func (s *Service) SaveIMAP(ctx context.Context, accountID, email, appPassword st
 	return s.summaryForSession(saved), nil
 }
 
-func (s *Service) KeepAlive(ctx context.Context) {
-	for _, session := range s.store.ICloudSessions() {
-		if _, ok := protocol.LoginStateForKind(session, domain.LoginStateAppleAccount); !ok {
-			continue
-		}
-		updated, err := s.client.CheckAppleAccountManageSession(ctx, session)
-		if err != nil {
-			markLoginState(&session, domain.LoginStateAppleAccount, false, err.Error())
-			_, _ = s.store.SaveICloudSession(session)
-			continue
-		}
-		markLoginState(&updated, domain.LoginStateAppleAccount, true, "Apple Account 登录态保活成功")
-		_, _ = s.store.SaveICloudSession(updated)
-	}
+func (s *Service) KeepAliveState(ctx context.Context, state domain.LoginState) (domain.LoginState, error) {
+	return s.client.KeepAliveAppleAccountManageState(ctx, state)
 }
 
 func (s *Service) summaryForSession(session domain.ICloudSession) AccountSummary {

@@ -116,6 +116,7 @@ go run main.go
 - 隐私邮箱总数和当前可用数量。
 - 本地邮件缓存数量。
 - 最近运行事件，可通过右上角清空按钮清除。
+- Apple 登录态每次实际发起保活请求时记录开始和结果；成功、临时失败与登录态失效使用不同级别展示，控制台会定时刷新。
 - IMAP 监听、Apple 登录态保活、自动创建和公共取号 API 的运行状态。
 
 控制台只展示汇总信息。具体账号操作进入“Apple 账号”，邮箱和验证码操作进入“邮箱池”，创建任务进入“创建隐私邮箱”。
@@ -394,7 +395,7 @@ GET  /api/v1/public-code?email={email}
 | `icloud_client_id` | 内置默认值 | iCloud Web 协议客户端 ID |
 | `apple_account_api_key` | 空 | Apple Account 管理接口备用 API Key |
 | `apple_account_keep_alive_enabled` | `true` | 是否加载登录态保活能力 |
-| `apple_account_keep_alive_ms` | `240000` | 保活基础间隔 |
+| `apple_account_keep_alive_ms` | `180000` | 保活基础间隔；后台每 30 秒扫描，每轮重新生成随机间隔 |
 | `apple_account_keep_alive_jitter_percent` | `15` | 保活随机浮动比例 |
 | `mail_watcher_enabled` | `true` | 是否加载 IMAP 监听能力 |
 | `mail_watcher_poll_ms` | `3000` | 监听分组重检间隔 |

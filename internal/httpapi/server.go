@@ -31,21 +31,30 @@ type contextKey string
 
 const adminContextKey contextKey = "admin"
 
+type appleKeepAliveTarget struct {
+	CheckedAt time.Time
+	NextAt    time.Time
+	Interval  time.Duration
+}
+
 type Server struct {
-	cfg               config.Config
-	runtimeCtx        context.Context
-	store             *store.Store
-	auth              *auth.Service
-	apple             *apple.Service
-	mailbox           *mailboxservice.Service
-	scheduler         *scheduler.Service
-	watcher           *mailwatcher.Service
-	updates           *updatecheck.Service
-	log               *slog.Logger
-	mux               *http.ServeMux
-	keepAliveMu       sync.RWMutex
-	keepAliveNextAt   time.Time
-	keepAliveInterval time.Duration
+	cfg                 config.Config
+	runtimeCtx          context.Context
+	store               *store.Store
+	auth                *auth.Service
+	apple               *apple.Service
+	mailbox             *mailboxservice.Service
+	scheduler           *scheduler.Service
+	watcher             *mailwatcher.Service
+	updates             *updatecheck.Service
+	log                 *slog.Logger
+	mux                 *http.ServeMux
+	keepAliveMu         sync.RWMutex
+	keepAliveNextAt     time.Time
+	keepAliveInterval   time.Duration
+	keepAliveState      func(context.Context, domain.LoginState) (domain.LoginState, error)
+	keepAliveTargets    map[string]appleKeepAliveTarget
+	keepAliveIntervalFn func(time.Duration, int) time.Duration
 }
 
 func New(cfg config.Config, state *store.Store, logger *slog.Logger) *Server {
@@ -53,18 +62,21 @@ func New(cfg config.Config, state *store.Store, logger *slog.Logger) *Server {
 		logger = slog.Default()
 	}
 	s := &Server{
-		cfg:        cfg,
-		runtimeCtx: context.Background(),
-		store:      state,
-		auth:       auth.NewService(state, time.Duration(cfg.SessionTTLHours)*time.Hour),
-		apple:      apple.NewService(cfg, state),
-		mailbox:    mailboxservice.NewService(cfg, state),
-		updates:    updatecheck.New(cfg.UpdateEnabled, cfg.UpdateRepository),
-		log:        logger,
-		mux:        http.NewServeMux(),
+		cfg:              cfg,
+		runtimeCtx:       context.Background(),
+		store:            state,
+		auth:             auth.NewService(state, time.Duration(cfg.SessionTTLHours)*time.Hour),
+		apple:            apple.NewService(cfg, state),
+		mailbox:          mailboxservice.NewService(cfg, state),
+		updates:          updatecheck.New(cfg.UpdateEnabled, cfg.UpdateRepository),
+		log:              logger,
+		mux:              http.NewServeMux(),
+		keepAliveTargets: make(map[string]appleKeepAliveTarget),
 	}
 	s.scheduler = scheduler.NewService(state, s.mailbox)
 	s.watcher = mailwatcher.NewService(cfg, state, s.mailbox, logger)
+	s.keepAliveState = s.apple.KeepAliveState
+	s.keepAliveIntervalFn = randomAppleKeepAliveInterval
 	s.routes()
 	return s
 }
@@ -138,44 +150,190 @@ func (s *Server) StartBackground(ctx context.Context) {
 
 func (s *Server) runAppleKeepAlive(ctx context.Context) {
 	baseInterval := time.Duration(s.cfg.AppleAccountKeepAliveMS) * time.Millisecond
-	if baseInterval < time.Minute {
-		baseInterval = 4 * time.Minute
+	if baseInterval <= 0 {
+		baseInterval = 3 * time.Minute
 	}
+	scanInterval := appleKeepAliveScanInterval(baseInterval)
 	defer s.setAppleKeepAliveSchedule(time.Time{}, 0)
-	s.log.Info("Apple 登录态保活已启动", "基础间隔", baseInterval, "随机浮动", fmt.Sprintf("±%d%%", s.cfg.AppleAccountKeepAliveJitterPercent))
+	s.log.Info("Apple 登录态保活已启动", "基础间隔", baseInterval, "扫描间隔", scanInterval, "每轮随机", fmt.Sprintf("±%d%%", s.cfg.AppleAccountKeepAliveJitterPercent))
+	s.keepAliveAppleRound(ctx, baseInterval)
+	ticker := time.NewTicker(scanInterval)
+	defer ticker.Stop()
 	for {
-		interval := s.randomAppleKeepAliveInterval(baseInterval)
-		nextAt := time.Now().Add(interval)
-		s.setAppleKeepAliveSchedule(nextAt, interval)
-		timer := time.NewTimer(interval)
+		s.setAppleKeepAliveSchedule(time.Now().Add(scanInterval), baseInterval)
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			s.log.Info("Apple 登录态保活已停止")
 			return
-		case <-timer.C:
-			if s.store.Settings().EnableAppleKeepAlive {
-				s.apple.KeepAlive(ctx)
-			}
+		case <-ticker.C:
+			s.keepAliveAppleRound(ctx, baseInterval)
 		}
 	}
 }
 
-func (s *Server) randomAppleKeepAliveInterval(base time.Duration) time.Duration {
-	percent := s.cfg.AppleAccountKeepAliveJitterPercent
-	if percent <= 0 {
+func appleKeepAliveScanInterval(base time.Duration) time.Duration {
+	if base <= 0 {
+		base = 3 * time.Minute
+	}
+	interval := base / 4
+	if interval > 30*time.Second {
+		return 30 * time.Second
+	}
+	if interval < 5*time.Second {
+		return 5 * time.Second
+	}
+	return interval
+}
+
+func (s *Server) keepAliveAppleRound(ctx context.Context, baseInterval time.Duration) {
+	if ctx.Err() != nil || !s.store.Settings().EnableAppleKeepAlive {
+		return
+	}
+	keepAliveState := s.keepAliveState
+	if keepAliveState == nil {
+		keepAliveState = s.apple.KeepAliveState
+	}
+	now := time.Now()
+	for _, session := range s.store.ICloudSessions() {
+		if ctx.Err() != nil {
+			return
+		}
+		state, ok := protocol.LoginStateForKind(session, domain.LoginStateAppleAccount)
+		if !ok || !appleKeepAliveEligible(state) {
+			continue
+		}
+		nextAt, _ := s.appleKeepAliveTargetForSession(session, state, baseInterval)
+		if now.Before(nextAt) {
+			continue
+		}
+		accountLabel := strings.TrimSpace(session.AppleID)
+		if accountLabel == "" {
+			accountLabel = session.AccountID
+		}
+		s.recordAppleKeepAliveEvent("info", fmt.Sprintf("开始 Apple 登录态保活：%s", accountLabel))
+		callCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		next, err := keepAliveState(callCtx, state)
+		cancel()
+		if err != nil {
+			code, _, _ := protocol.ErrorDetails(err)
+			if code == "apple_account_auth_failed" {
+				s.clearAppleKeepAliveTarget(session)
+				state.LastCheckedAt = time.Now()
+				state.LastCheckOK = false
+				state.LastStatusMessage = "Apple Account 登录态已失效：" + err.Error()
+				session = protocol.WithLoginState(session, state)
+				message := fmt.Sprintf("Apple 登录态保活失败：%s；登录态已失效，需要重新登录；%s", accountLabel, err.Error())
+				if _, saveErr := s.store.SaveICloudSessionWithEvent(session, "error", message); saveErr != nil {
+					s.log.Warn("保存 Apple 登录态失效结果失败", "账号", session.AccountID, "错误", saveErr)
+				}
+			} else {
+				s.recordAppleKeepAliveEvent("warning", fmt.Sprintf("Apple 登录态保活临时失败：%s；%s", accountLabel, err.Error()))
+			}
+			s.log.Warn("Apple 登录态保活失败", "账号", session.AccountID, "Apple ID", session.AppleID, "错误", err)
+			continue
+		}
+		next.Kind = domain.LoginStateAppleAccount
+		next.LastCheckedAt = time.Now()
+		next.LastCheckOK = true
+		next.LastStatusMessage = "Apple Account 登录态保活成功"
+		session = protocol.WithLoginState(session, next)
+		nextInterval := s.resetAppleKeepAliveTarget(session, next, baseInterval)
+		message := fmt.Sprintf("Apple 登录态保活成功：%s；下次目标间隔 %s", accountLabel, nextInterval.Round(time.Second))
+		if _, err := s.store.SaveICloudSessionWithEvent(session, "info", message); err != nil {
+			s.log.Warn("保存 Apple 登录态保活结果失败", "账号", session.AccountID, "错误", err)
+			continue
+		}
+		s.log.Info("Apple 登录态保活成功", "账号", session.AccountID, "Apple ID", session.AppleID, "下次目标间隔", nextInterval)
+	}
+}
+
+func (s *Server) recordAppleKeepAliveEvent(level, message string) {
+	if err := s.store.RecordEvent(level, "apple", message); err != nil {
+		s.log.Warn("保存 Apple 登录态保活运行记录失败", "错误", err)
+	}
+}
+
+func appleKeepAliveEligible(state domain.LoginState) bool {
+	if strings.TrimSpace(state.Scnt) == "" || strings.TrimSpace(state.APIKey) == "" || len(state.Cookies) == 0 {
+		return false
+	}
+	return state.LastCheckedAt.IsZero() || state.LastCheckOK
+}
+
+func randomAppleKeepAliveInterval(base time.Duration, jitterPercent int) time.Duration {
+	if base <= 0 {
+		base = 3 * time.Minute
+	}
+	if jitterPercent <= 0 {
 		return base
 	}
-	spread := int64(base) * int64(percent) / 100
+	if jitterPercent > 50 {
+		jitterPercent = 50
+	}
+	spread := int64(base) * int64(jitterPercent) / 100
 	if spread <= 0 {
 		return base
 	}
 	offset := rand.Int64N(spread*2+1) - spread
 	interval := base + time.Duration(offset)
-	if interval < time.Minute {
-		return time.Minute
+	if interval < 30*time.Second {
+		return 30 * time.Second
 	}
 	return interval
+}
+
+func (s *Server) appleKeepAliveTargetForSession(session domain.ICloudSession, state domain.LoginState, baseInterval time.Duration) (time.Time, time.Duration) {
+	key := appleKeepAliveSessionKey(session)
+	s.keepAliveMu.Lock()
+	defer s.keepAliveMu.Unlock()
+	target, ok := s.keepAliveTargets[key]
+	if ok && target.CheckedAt.Equal(state.LastCheckedAt) {
+		return target.NextAt, target.Interval
+	}
+	interval := s.nextAppleKeepAliveInterval(baseInterval)
+	nextAt := time.Now()
+	if !state.LastCheckedAt.IsZero() {
+		nextAt = state.LastCheckedAt.Add(interval)
+	}
+	target = appleKeepAliveTarget{CheckedAt: state.LastCheckedAt, NextAt: nextAt, Interval: interval}
+	s.keepAliveTargets[key] = target
+	return target.NextAt, target.Interval
+}
+
+func (s *Server) resetAppleKeepAliveTarget(session domain.ICloudSession, state domain.LoginState, baseInterval time.Duration) time.Duration {
+	interval := s.nextAppleKeepAliveInterval(baseInterval)
+	s.keepAliveMu.Lock()
+	s.keepAliveTargets[appleKeepAliveSessionKey(session)] = appleKeepAliveTarget{
+		CheckedAt: state.LastCheckedAt,
+		NextAt:    state.LastCheckedAt.Add(interval),
+		Interval:  interval,
+	}
+	s.keepAliveMu.Unlock()
+	return interval
+}
+
+func (s *Server) clearAppleKeepAliveTarget(session domain.ICloudSession) {
+	s.keepAliveMu.Lock()
+	delete(s.keepAliveTargets, appleKeepAliveSessionKey(session))
+	s.keepAliveMu.Unlock()
+}
+
+func (s *Server) nextAppleKeepAliveInterval(baseInterval time.Duration) time.Duration {
+	intervalFn := s.keepAliveIntervalFn
+	if intervalFn == nil {
+		intervalFn = randomAppleKeepAliveInterval
+	}
+	return intervalFn(baseInterval, s.cfg.AppleAccountKeepAliveJitterPercent)
+}
+
+func appleKeepAliveSessionKey(session domain.ICloudSession) string {
+	if accountID := strings.TrimSpace(session.AccountID); accountID != "" {
+		return accountID
+	}
+	if appleID := strings.ToLower(strings.TrimSpace(session.AppleID)); appleID != "" {
+		return appleID
+	}
+	return "default"
 }
 
 func (s *Server) setAppleKeepAliveSchedule(nextAt time.Time, interval time.Duration) {
@@ -195,6 +353,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "same-origin")
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	s.mux.ServeHTTP(w, r)
 }
 

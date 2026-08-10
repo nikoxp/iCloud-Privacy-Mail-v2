@@ -42,8 +42,24 @@ func (s *Store) ICloudSessionByAccountID(accountID string) (domain.ICloudSession
 }
 
 func (s *Store) SaveICloudSession(session domain.ICloudSession) (domain.ICloudSession, error) {
+	return s.saveICloudSession(session, "info", "已更新 Apple 登录态", "已保存 Apple 登录态")
+}
+
+func (s *Store) SaveICloudSessionWithEvent(session domain.ICloudSession, level, message string) (domain.ICloudSession, error) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "已更新 Apple 登录态"
+	}
+	return s.saveICloudSession(session, level, message, message)
+}
+
+func (s *Store) saveICloudSession(session domain.ICloudSession, level, updateMessage, createMessage string) (domain.ICloudSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	level = strings.TrimSpace(level)
+	if level == "" {
+		level = "info"
+	}
 	if strings.TrimSpace(session.AccountID) != "" {
 		accountExists := false
 		for _, account := range s.state.AppleAccounts {
@@ -72,13 +88,13 @@ func (s *Store) SaveICloudSession(session domain.ICloudSession) (domain.ICloudSe
 			merged := mergeICloudSession(existing, session)
 			s.state.ICloudSessions[i] = merged
 			s.touchAppleAccountLocked(merged.AccountID, merged)
-			s.appendEventLocked("info", "apple", "已更新 Apple 登录态")
+			s.appendEventLocked(level, "apple", updateMessage)
 			return cloneICloudSession(merged), s.saveLocked()
 		}
 	}
 	s.state.ICloudSessions = append(s.state.ICloudSessions, cloneICloudSession(session))
 	s.touchAppleAccountLocked(session.AccountID, session)
-	s.appendEventLocked("info", "apple", "已保存 Apple 登录态")
+	s.appendEventLocked(level, "apple", createMessage)
 	return cloneICloudSession(session), s.saveLocked()
 }
 

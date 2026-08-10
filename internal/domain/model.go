@@ -239,7 +239,7 @@ type Task struct {
 
 func DefaultSettings() Settings {
 	return Settings{
-		MailboxPageSize:         20,
+		MailboxPageSize:         7,
 		EnableMailWatcher:       false,
 		EnableAppleKeepAlive:    false,
 		EnablePublicMailboxAPI:  false,
@@ -257,6 +257,6 @@ func DefaultCreateSettings() CreateSettings {
 		ICloudWebTwoFactorMethod:      "trusted_device",
 		SchedulerIntervalMinutes:      60,
 		SchedulerRoundIntervalSeconds: 5,
-		MailboxPageSize:               20,
+		MailboxPageSize:               7,
 	}
 }

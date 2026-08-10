@@ -378,7 +378,7 @@ func (s *Store) Mailboxes(query, status, accountID string, page, pageSize int) d
 		pageSize = s.state.Settings.MailboxPageSize
 	}
 	if pageSize <= 0 {
-		pageSize = 20
+		pageSize = domain.DefaultSettings().MailboxPageSize
 	}
 	if pageSize > 200 {
 		pageSize = 200
@@ -461,7 +461,7 @@ func (s *Store) SaveSettings(settings domain.Settings) (domain.Settings, error) 
 	defer s.mu.Unlock()
 	settings.PublicAPIKey = strings.TrimSpace(settings.PublicAPIKey)
 	if settings.MailboxPageSize <= 0 {
-		settings.MailboxPageSize = 20
+		settings.MailboxPageSize = domain.DefaultSettings().MailboxPageSize
 	}
 	if settings.MailboxPageSize > 200 {
 		settings.MailboxPageSize = 200
@@ -487,6 +487,25 @@ func (s *Store) ClearEvents() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.Events = nil
+	return s.saveLocked()
+}
+
+func (s *Store) RecordEvent(level, category, message string) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil
+	}
+	level = strings.TrimSpace(level)
+	if level == "" {
+		level = "info"
+	}
+	category = strings.TrimSpace(category)
+	if category == "" {
+		category = "system"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appendEventLocked(level, category, message)
 	return s.saveLocked()
 }
 

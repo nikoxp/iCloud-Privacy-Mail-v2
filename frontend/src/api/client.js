@@ -14,6 +14,7 @@ export async function api(path, options = {}) {
   }
   const response = await fetch(path, {
     credentials: 'same-origin',
+    cache: path.startsWith('/api/') ? 'no-store' : 'default',
     ...options,
     headers,
   })

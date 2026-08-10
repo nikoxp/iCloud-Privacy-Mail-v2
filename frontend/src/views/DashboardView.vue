@@ -13,6 +13,8 @@ const runtimeTasks = ref([])
 const currentTime = ref(Date.now())
 let countdownTimer
 let runtimeRefreshTimer
+let eventRefreshTimer
+let eventRefreshing = false
 const { error: showError, success: showSuccess } = useToast()
 const { confirm: confirmAction } = useConfirm()
 
@@ -59,8 +61,8 @@ function countdownText(value) {
 
 function taskDescription(task) {
   if (task.id !== 'apple-keepalive' || task.status !== 'running') return task.description
-  const jitter = task.jitter_percent ? ` · 随机 ±${task.jitter_percent}%` : ''
-  return `下次保活 ${countdownText(task.next_run_at)}${jitter}`
+  const jitter = task.jitter_percent ? ` · 每轮随机 ±${task.jitter_percent}%` : ''
+  return `下次扫描 ${countdownText(task.next_run_at)}${jitter}`
 }
 
 async function refreshRuntimeTasks() {
@@ -69,6 +71,19 @@ async function refreshRuntimeTasks() {
     runtimeTasks.value = taskData.items || []
   } catch {
     return
+  }
+}
+
+async function refreshEvents() {
+  if (eventRefreshing) return
+  eventRefreshing = true
+  try {
+    const eventData = await api('/api/events')
+    dashboard.value.events = eventData.items || []
+  } catch {
+    return
+  } finally {
+    eventRefreshing = false
   }
 }
 
@@ -117,11 +132,13 @@ onMounted(async () => {
   }
   countdownTimer = window.setInterval(() => { currentTime.value = Date.now() }, 1000)
   runtimeRefreshTimer = window.setInterval(refreshRuntimeTasks, 10000)
+  eventRefreshTimer = window.setInterval(refreshEvents, 2000)
 })
 
 onBeforeUnmount(() => {
   window.clearInterval(countdownTimer)
   window.clearInterval(runtimeRefreshTimer)
+  window.clearInterval(eventRefreshTimer)
 })
 </script>
 
@@ -140,9 +157,9 @@ onBeforeUnmount(() => {
       <div class="grid items-stretch gap-6 xl:grid-cols-[1fr_330px]">
         <section class="panel h-full overflow-hidden">
           <div class="flex items-center justify-between border-b border-slate-100 px-5 py-4 dark:border-slate-700"><div><h2 class="font-bold text-slate-800 dark:text-slate-100">运行记录</h2><p class="mt-0.5 text-xs text-slate-400">最近产生的系统事件</p></div><div class="flex items-center gap-1"><button class="icon-button" title="清空运行记录" :disabled="clearing || !dashboard.events?.length" @click="clearEvents"><LoaderCircle v-if="clearing" :size="17" class="animate-spin" /><Trash2 v-else :size="17" /></button><Inbox :size="19" class="text-slate-400" /></div></div>
-          <div v-if="!dashboard.events?.length" class="flex min-h-72 flex-col items-center justify-center gap-3 text-slate-400"><MailCheck :size="35" class="text-emerald-400" /><div class="text-sm">暂无运行事件</div></div>
-          <div v-else class="max-h-[486.5px] divide-y divide-slate-100 overflow-y-auto dark:divide-slate-700/70">
-            <div v-for="event in dashboard.events" :key="event.id" class="flex items-center gap-3 px-5 py-3.5"><div :class="eventTone(event.level)" class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg"><CircleAlert v-if="event.level === 'error'" :size="14" /><CheckCircle2 v-else :size="14" /></div><div class="min-w-0 flex-1"><div class="break-words text-sm text-slate-700 dark:text-slate-200">{{ event.message }}</div><div class="mt-1 flex gap-2 text-[11px] text-slate-400"><span>{{ event.category }}</span><span>·</span><span>{{ formatTime(event.created_at) }}</span></div></div></div>
+          <div v-if="!dashboard.events?.length" class="flex h-[486.5px] flex-col items-center justify-center gap-3 text-slate-400"><MailCheck :size="35" class="text-emerald-400" /><div class="text-sm">暂无运行事件</div></div>
+          <div v-else class="h-[486.5px] overflow-y-auto">
+            <div v-for="event in dashboard.events" :key="event.id" class="flex min-h-[69.5px] items-center gap-3 border-b border-slate-100 px-5 py-3.5 dark:border-slate-700/70"><div :class="eventTone(event.level)" class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg"><CircleAlert v-if="event.level === 'error'" :size="14" /><CheckCircle2 v-else :size="14" /></div><div class="min-w-0 flex-1"><div class="break-words text-sm text-slate-700 dark:text-slate-200">{{ event.message }}</div><div class="mt-1 flex gap-2 text-[11px] text-slate-400"><span>{{ event.category }}</span><span>·</span><span>{{ formatTime(event.created_at) }}</span></div></div></div>
           </div>
         </section>
 

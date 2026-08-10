@@ -13,7 +13,7 @@ const dataPath = ref('')
 const runtime = ref({})
 const showPublicAPIKey = ref(false)
 const form = reactive({
-  mailbox_page_size: 20,
+  mailbox_page_size: 7,
   enable_mail_watcher: false,
   enable_apple_keep_alive: false,
   enable_public_mailbox_api: false,
@@ -118,7 +118,7 @@ onMounted(async () => {
     <template v-else>
       <form class="panel space-y-7 p-5 sm:p-7" @submit.prevent="saveSystem">
         <section><h3 class="section-title flex items-center gap-2"><Database :size="16" />本地数据</h3><div class="grid gap-4 sm:grid-cols-2"><label class="form-group"><span class="form-label">邮箱池每页数量</span><input v-model.number="form.mailbox_page_size" class="field" type="number" min="5" max="200" /><span class="form-help">控制邮箱池列表单页显示数量。</span></label><label class="form-group"><span class="form-label">状态文件</span><input :value="dataPath" class="field font-mono text-xs" readonly /><span class="form-help">账号登录态和 App 专用密码也保存在此本地文件。</span></label></div></section>
-        <section><h3 class="section-title flex items-center gap-2"><ShieldCheck :size="16" />后台能力</h3><div class="grid gap-4 sm:grid-cols-2"><label class="toggle-card"><span><strong>IMAP 实时邮件监听</strong><small>使用 IDLE 接收事件，每 {{ runtime.mail_watcher_poll_ms || 3000 }} 毫秒重检分组；首次最多拉取 {{ runtime.mail_watcher_initial_fetch_limit || 20 }} 封</small></span><input v-model="form.enable_mail_watcher" class="detail-switch" type="checkbox" :disabled="!runtime.mail_watcher_available" /></label><label class="toggle-card"><span><strong>Apple 登录态保活</strong><small>基础 {{ Math.round((runtime.apple_keep_alive_ms || 240000) / 60000) }} 分钟；每轮随机 ±{{ runtime.apple_keep_alive_jitter_percent ?? 15 }}%</small></span><input v-model="form.enable_apple_keep_alive" class="detail-switch" type="checkbox" :disabled="!runtime.apple_keep_alive_available" /></label></div></section>
+        <section><h3 class="section-title flex items-center gap-2"><ShieldCheck :size="16" />后台能力</h3><div class="grid gap-4 sm:grid-cols-2"><label class="toggle-card"><span><strong>IMAP 实时邮件监听</strong><small>使用 IDLE 接收事件，每 {{ runtime.mail_watcher_poll_ms || 3000 }} 毫秒重检分组；首次最多拉取 {{ runtime.mail_watcher_initial_fetch_limit || 20 }} 封</small></span><input v-model="form.enable_mail_watcher" class="detail-switch" type="checkbox" :disabled="!runtime.mail_watcher_available" /></label><label class="toggle-card"><span><strong>Apple 登录态保活</strong><small>基础 {{ Math.round((runtime.apple_keep_alive_ms || 180000) / 60000) }} 分钟；每 30 秒扫描并在每轮重新随机 ±{{ runtime.apple_keep_alive_jitter_percent ?? 15 }}%</small></span><input v-model="form.enable_apple_keep_alive" class="detail-switch" type="checkbox" :disabled="!runtime.apple_keep_alive_available" /></label></div></section>
         <section>
           <h3 class="section-title flex items-center gap-2"><Globe2 :size="16" />公共访问</h3>
           <div class="grid gap-4 sm:grid-cols-2">
