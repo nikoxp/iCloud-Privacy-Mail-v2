@@ -9,6 +9,7 @@
 - Apple Account 新接口、iCloud Web 旧接口登录和两步验证。
 - iCloud IMAP App 专用密码、IDLE 监听、邮件同步和验证码提取。
 - 隐私邮箱创建、同步、导入、筛选、状态、远端清理和远端删除。
+- 邮箱池支持点击邮箱复制、标签/备注双行展示、备注与状态快捷编辑，以及带二次确认的串行删除队列。
 - 单次创建与多账号自动创建，默认生成 `x_1`、`x_2` 等连续标签。
 - 公共取号 API、邮箱独立取码 API、独立公共验证码页面。
 - 运行数据、邮件、邮箱地址和取码 API 本地导出。
@@ -53,6 +54,14 @@ go run main.go -config config.json
 
 Vue 开发地址为 `http://127.0.0.1:5174/`，Go API 地址为 `http://127.0.0.1:8788/`。
 
+`go run main.go` 使用 `internal/webui/dist` 中的 Go 内嵌前端资源，不会直接读取 `frontend/src`。修改前端后如果要在 `http://127.0.0.1:8788/` 查看效果，请在项目根目录执行：
+
+```bash
+npm --prefix frontend run build
+./scripts/sync-web.sh
+go run main.go
+```
+
 ## 页面
 
 | 路由 | 功能 |
@@ -60,7 +69,7 @@ Vue 开发地址为 `http://127.0.0.1:5174/`，Go API 地址为 `http://127.0.0.
 | `/login` | 首次创建管理员、后续登录 |
 | `/` | 账号、邮箱、邮件统计，运行记录和后台状态 |
 | `/apple-accounts` | Apple 登录、2FA、登录态检测、IMAP、创建和同步 |
-| `/mailboxes` | 搜索筛选、详情、邮件、取码、远端清理和删除 |
+| `/mailboxes` | 搜索筛选、点击复制、快捷编辑、详情、邮件、取码、远端清理和串行彻底删除 |
 | `/tasks` | 创建一个邮箱、自动创建、默认值和调度日志 |
 | `/exports` | 运行数据、邮件、邮箱和 API 导出 |
 | `/settings` | 本地数据、后台能力、公共访问、API Key 和版本检查 |

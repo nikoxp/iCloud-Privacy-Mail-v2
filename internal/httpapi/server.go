@@ -449,10 +449,10 @@ func (s *Server) handleMailbox(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMailboxStatus(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		APIActive    *bool  `json:"api_active"`
-		ICloudActive *bool  `json:"icloud_active"`
-		Status       string `json:"status"`
-		Note         string `json:"note"`
+		APIActive    *bool   `json:"api_active"`
+		ICloudActive *bool   `json:"icloud_active"`
+		Status       string  `json:"status"`
+		Note         *string `json:"note"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())

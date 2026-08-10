@@ -116,7 +116,7 @@ func (s *Store) SetMailboxRemoteIdentity(id, anonymousID, origin string) (domain
 	return s.state.Mailboxes[index], s.saveLocked()
 }
 
-func (s *Store) SetMailboxStatus(id string, apiActive, icloudActive *bool, status, note string) (domain.Mailbox, error) {
+func (s *Store) SetMailboxStatus(id string, apiActive, icloudActive *bool, status string, note *string) (domain.Mailbox, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	index := s.mailboxIndexLocked(id)
@@ -133,8 +133,8 @@ func (s *Store) SetMailboxStatus(id string, apiActive, icloudActive *bool, statu
 	if strings.TrimSpace(status) != "" {
 		mailbox.Status = strings.TrimSpace(status)
 	}
-	if strings.TrimSpace(note) != "" {
-		mailbox.Note = strings.TrimSpace(note)
+	if note != nil {
+		mailbox.Note = strings.TrimSpace(*note)
 	}
 	mailbox.UpdatedAt = time.Now()
 	s.appendEventLocked("info", "mailbox", "已更新邮箱状态 "+mailbox.Email)

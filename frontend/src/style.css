@@ -82,7 +82,10 @@ button:disabled {
 
 .mailbox-list-scroll {
   overflow: auto;
-  scrollbar-gutter: stable;
+}
+
+.mailbox-list-scroll::-webkit-scrollbar-track:vertical {
+  margin-top: 2.5rem;
 }
 
 .card-select {
@@ -192,6 +195,42 @@ button:disabled {
 
 .secondary-button {
   @apply inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-600 transition hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-emerald-800 dark:hover:bg-emerald-950/40 dark:hover:text-emerald-300;
+}
+
+.mailbox-action-button {
+  @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-semibold transition active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-45;
+}
+
+.mailbox-action-sync {
+  @apply border-sky-200 bg-sky-50 text-sky-700 hover:border-sky-300 hover:bg-sky-100 active:border-sky-400 active:bg-sky-200 active:text-sky-900 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-300 dark:hover:border-sky-700 dark:hover:bg-sky-900/60 dark:active:border-sky-500 dark:active:bg-sky-800 dark:active:text-sky-50;
+}
+
+.mailbox-action-sync-selected {
+  @apply border-sky-400 bg-sky-200 text-sky-900 ring-2 ring-sky-300/40 dark:border-sky-500 dark:bg-sky-800 dark:text-sky-50 dark:ring-sky-500/30;
+}
+
+.mailbox-action-code {
+  @apply border-amber-200 bg-amber-50 text-amber-700 hover:border-amber-300 hover:bg-amber-100 active:border-amber-400 active:bg-amber-200 active:text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300 dark:hover:border-amber-700 dark:hover:bg-amber-900/60 dark:active:border-amber-500 dark:active:bg-amber-800 dark:active:text-amber-50;
+}
+
+.mailbox-action-code-selected {
+  @apply border-amber-400 bg-amber-200 text-amber-900 ring-2 ring-amber-300/40 dark:border-amber-500 dark:bg-amber-800 dark:text-amber-50 dark:ring-amber-500/30;
+}
+
+.mailbox-action-detail {
+  @apply border-violet-200 bg-violet-50 text-violet-700 hover:border-violet-300 hover:bg-violet-100 active:border-violet-400 active:bg-violet-200 active:text-violet-900 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-300 dark:hover:border-violet-700 dark:hover:bg-violet-900/60 dark:active:border-violet-500 dark:active:bg-violet-800 dark:active:text-violet-50;
+}
+
+.mailbox-action-detail-selected {
+  @apply border-violet-400 bg-violet-200 text-violet-900 ring-2 ring-violet-300/40 dark:border-violet-500 dark:bg-violet-800 dark:text-violet-50 dark:ring-violet-500/30;
+}
+
+.mailbox-action-delete {
+  @apply w-20 border-rose-200 bg-rose-50 text-rose-600 hover:border-rose-300 hover:bg-rose-100 active:border-rose-400 active:bg-rose-200 active:text-rose-900 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300 dark:hover:border-rose-700 dark:hover:bg-rose-900/60 dark:active:border-rose-500 dark:active:bg-rose-800 dark:active:text-rose-50;
+}
+
+.mailbox-action-delete-selected {
+  @apply border-rose-400 bg-rose-200 text-rose-900 ring-2 ring-rose-300/40 disabled:opacity-100 dark:border-rose-500 dark:bg-rose-800 dark:text-rose-50 dark:ring-rose-500/30;
 }
 
 .detail-button {

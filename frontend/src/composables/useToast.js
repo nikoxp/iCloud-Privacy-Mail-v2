@@ -14,11 +14,25 @@ function remove(id) {
 function push(text, type = 'success', duration = 5000) {
   if (!text) return null
   const id = nextId++
-  notices.value = [...notices.value, { id, text: String(text), type }]
+  notices.value = [...notices.value, { id, text: String(text), type, persistent: duration <= 0 }]
   while (notices.value.length > 3) {
-    remove(notices.value[0].id)
+    const removable = notices.value.find((item) => !item.persistent) || notices.value[0]
+    remove(removable.id)
   }
-  timers.set(id, window.setTimeout(() => remove(id), duration))
+  if (duration > 0) timers.set(id, window.setTimeout(() => remove(id), duration))
+  return id
+}
+
+function update(id, text, type = 'success', duration = 5000) {
+  if (!text) return id
+  if (!notices.value.some((item) => item.id === id)) return push(text, type, duration)
+  const timer = timers.get(id)
+  if (timer) clearTimeout(timer)
+  timers.delete(id)
+  notices.value = notices.value.map((item) => item.id === id
+    ? { ...item, text: String(text), type, persistent: duration <= 0 }
+    : item)
+  if (duration > 0) timers.set(id, window.setTimeout(() => remove(id), duration))
   return id
 }
 
@@ -30,6 +44,7 @@ export function useToast() {
     error: (text, duration = 5000) => push(text, 'error', duration),
     info: (text, duration = 5000) => push(text, 'info', duration),
     warning: (text, duration = 5000) => push(text, 'warning', duration),
+    update,
     dismiss: remove,
   }
 }

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Boxes, ChevronLeft, ChevronRight, Clipboard, CloudDownload, CloudOff, KeyRound, LoaderCircle, MailOpen, MailPlus, RefreshCw, Save, Search, ShieldX, Trash2, X } from '@lucide/vue'
 import { api } from '../api/client'
 import CardSelect from '../components/CardSelect.vue'
+import FormDialog from '../components/FormDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 
@@ -26,7 +27,14 @@ const accounts = ref([])
 const showBatchClean = ref(false)
 const showImport = ref(false)
 const showSync = ref(false)
+const quickEditOpen = ref(false)
+const quickEditField = ref('note')
+const quickEditMailbox = ref(null)
+const deleteConfirmID = ref('')
+const deleteQueue = ref([])
+const deletingMailboxID = ref('')
 const edit = reactive({ status: 'available', api_active: true, icloud_active: true, note: '' })
+const quickEdit = reactive({ status: 'available', note: '' })
 const remoteClean = reactive({ move_synced: true, empty_trash: true })
 const batchClean = reactive({ account_id: '', move_synced: true, empty_trash: true })
 const mailboxImport = reactive({ account_id: '', email: '', label: '', note: '' })
@@ -35,7 +43,12 @@ let searchTimer
 let loadingTimer
 let codeBusyTimer
 let loadRequestID = 0
-const { success, error: showError } = useToast()
+let deleteQueueRunning = false
+let deleteNoticeID = null
+let deleteSucceeded = 0
+let deleteFailed = 0
+let deleteLastError = ''
+const { success, error: showError, update: updateToast } = useToast()
 const { confirm: confirmAction } = useConfirm()
 const mailboxStatusOptions = [
   { value: '', label: '全部状态', dot: 'bg-slate-400' },
@@ -63,6 +76,7 @@ const accountFilterOptions = computed(() => [
 ])
 const syncAccountOptions = computed(() => [{ value: '', label: '全部 Apple 账号', dot: 'bg-slate-400' }, ...accounts.value.map((account) => ({ value: account.id, label: `${account.label || account.apple_id || account.id}（${account.apple_id}）` }))])
 const codeDialogBusy = computed(() => busy.value === 'code' || busy.value.startsWith('code-row:'))
+const quickEditTitle = computed(() => quickEditField.value === 'note' ? '修改备注' : '修改邮箱状态')
 
 const rangeText = computed(() => {
   if (!result.value.total) return '0 条记录'
@@ -85,6 +99,32 @@ function statusClass(value) {
 function flash(text, isError = false) {
   if (isError) showError(text)
   else success(text)
+}
+
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = value
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  textarea.remove()
+  if (!copied) throw new Error('复制失败')
+}
+
+async function copyMailboxEmail(mailbox) {
+  try {
+    await copyText(mailbox.email)
+    flash(`邮箱已复制：${mailbox.email}`)
+  } catch (err) {
+    flash(err.message || '复制邮箱失败，请重试', true)
+  }
 }
 
 function startCodeBusy(key) {
@@ -356,8 +396,46 @@ function closeCodeDialog() {
 
 async function copyCode() {
   if (!code.value?.code) return
-  await navigator.clipboard.writeText(code.value.code)
-  flash('验证码已复制')
+  try {
+    await copyText(code.value.code)
+    flash('验证码已复制')
+  } catch (err) {
+    flash(err.message || '复制验证码失败，请重试', true)
+  }
+}
+
+function openQuickEdit(mailbox, field) {
+  quickEditMailbox.value = mailbox
+  quickEditField.value = field
+  quickEdit.status = mailbox.status || 'available'
+  quickEdit.note = mailbox.note || ''
+  quickEditOpen.value = true
+}
+
+function closeQuickEdit() {
+  if (busy.value === 'quick-edit') return
+  quickEditOpen.value = false
+  quickEditMailbox.value = null
+}
+
+async function saveQuickEdit() {
+  if (!quickEditMailbox.value) return
+  const field = quickEditField.value
+  const payload = field === 'note'
+    ? { note: quickEdit.note }
+    : { status: quickEdit.status }
+  busy.value = 'quick-edit'
+  try {
+    await api(`/api/mailboxes/${quickEditMailbox.value.id}/status`, { method: 'POST', body: JSON.stringify(payload) })
+    flash(field === 'note' ? '邮箱备注已保存' : '邮箱状态已保存')
+    quickEditOpen.value = false
+    quickEditMailbox.value = null
+    await load()
+  } catch (err) {
+    flash(err.message, true)
+  } finally {
+    busy.value = ''
+  }
 }
 
 async function cleanRemote() {
@@ -408,30 +486,138 @@ async function cleanRemoteBatch() {
   }
 }
 
-async function removeMailbox(localOnly) {
-  if (!selected.value) return
+function isMailboxDeleteQueued(mailboxID) {
+  return deleteQueue.value.some((item) => item.id === mailboxID)
+}
+
+function isMailboxDeleteBusy(mailboxID) {
+  return deleteConfirmID.value === mailboxID || deletingMailboxID.value === mailboxID || isMailboxDeleteQueued(mailboxID)
+}
+
+function updateDeleteProgress() {
+  const current = deleteQueue.value[0]
+  if (!current) return
+  const waiting = Math.max(0, deleteQueue.value.length - (deletingMailboxID.value ? 1 : 0))
+  const action = deletingMailboxID.value ? `正在彻底删除：${current.email}` : `等待彻底删除：${current.email}`
+  const queueText = waiting ? `；另有 ${waiting} 个排队中` : ''
+  const finished = deleteSucceeded + deleteFailed
+  const finishedText = finished ? `；已处理 ${finished} 个（成功 ${deleteSucceeded}，失败 ${deleteFailed}）` : ''
+  deleteNoticeID = updateToast(deleteNoticeID, `${action}${queueText}${finishedText}`, 'info', 0)
+}
+
+function finishDeleteProgress() {
+  const total = deleteSucceeded + deleteFailed
+  const type = deleteFailed ? (deleteSucceeded ? 'warning' : 'error') : 'success'
+  const text = deleteFailed
+    ? `删除队列已结束：成功 ${deleteSucceeded} 个，失败 ${deleteFailed} 个${deleteLastError ? `；最近错误：${deleteLastError}` : ''}`
+    : `删除队列已完成：成功彻底删除 ${total} 个邮箱`
+  deleteNoticeID = updateToast(deleteNoticeID, text, type, 7000)
+}
+
+async function processDeleteQueue() {
+  if (deleteQueueRunning) return
+  deleteQueueRunning = true
+  try {
+    while (deleteQueue.value.length) {
+      const mailbox = deleteQueue.value[0]
+      deletingMailboxID.value = mailbox.id
+      updateDeleteProgress()
+      try {
+        await api(`/api/mailboxes/${mailbox.id}`, { method: 'DELETE' })
+        deleteSucceeded += 1
+        if (selected.value?.id === mailbox.id) {
+          selected.value = null
+          messages.value = []
+        }
+      } catch (err) {
+        deleteFailed += 1
+        deleteLastError = err.message
+      } finally {
+        deleteQueue.value.shift()
+        deletingMailboxID.value = ''
+        await load()
+      }
+    }
+  } finally {
+    deleteQueueRunning = false
+    deletingMailboxID.value = ''
+    finishDeleteProgress()
+  }
+}
+
+async function deleteMailbox(mailbox, localOnly) {
+  if (!mailbox) return
+  if (deleteConfirmID.value || deletingMailboxID.value || deleteQueue.value.length || busy.value) {
+    flash('请等待删除队列和当前操作完成', true)
+    return
+  }
+  deleteConfirmID.value = mailbox.id
   const text = localOnly
     ? '只删除本地记录和本地邮件，Apple 服务器上的隐私邮箱会保留。继续吗？'
-    : `将先从 Apple 服务器删除 ${selected.value.email}，再次查询确认远端不存在后才删除本地记录。继续吗？`
-  const confirmed = await confirmAction({
-    title: localOnly ? '只删除本地记录' : '彻底删除隐私邮箱',
-    message: text,
-    confirmText: localOnly ? '确认删除本地记录' : '确认彻底删除',
-    tone: 'danger',
-  })
-  if (!confirmed) return
-  busy.value = localOnly ? 'delete-local' : 'delete-remote'
+    : `将从 Apple 服务器彻底删除 ${mailbox.email}，确认远端不存在后再删除本地记录和邮件。此操作不可恢复，继续吗？`
   try {
-    const suffix = localOnly ? '?local_only=1' : ''
-    await api(`/api/mailboxes/${selected.value.id}${suffix}`, { method: 'DELETE' })
-    flash(localOnly ? '本地邮箱记录已删除' : 'Apple 服务器和本地邮箱记录均已删除')
-    selected.value = null
-    messages.value = []
-    await load()
-  } catch (err) {
-    flash(err.message, true)
+    const confirmed = await confirmAction({
+      title: localOnly ? '只删除本地记录' : '彻底删除隐私邮箱',
+      message: text,
+      confirmText: localOnly ? '确认删除本地记录' : '确认彻底删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
+    const busyKey = localOnly ? 'delete-local' : 'delete-remote'
+    busy.value = busyKey
+    deleteNoticeID = updateToast(deleteNoticeID, localOnly ? `正在删除本地记录：${mailbox.email}` : `正在彻底删除：${mailbox.email}`, 'info', 0)
+    try {
+      const suffix = localOnly ? '?local_only=1' : ''
+      await api(`/api/mailboxes/${mailbox.id}${suffix}`, { method: 'DELETE' })
+      deleteNoticeID = updateToast(deleteNoticeID, localOnly ? '本地邮箱记录已删除' : 'Apple 服务器和本地邮箱记录均已删除', 'success', 7000)
+      if (selected.value?.id === mailbox.id) {
+        selected.value = null
+        messages.value = []
+      }
+      await load()
+    } catch (err) {
+      deleteNoticeID = updateToast(deleteNoticeID, `删除失败：${err.message}`, 'error', 7000)
+    } finally {
+      busy.value = ''
+    }
   } finally {
-    busy.value = ''
+    deleteConfirmID.value = ''
+  }
+}
+
+function removeMailbox(localOnly) {
+  return deleteMailbox(selected.value, localOnly)
+}
+
+async function removeMailboxFromRow(mailbox) {
+  if (!mailbox) return
+  if (deleteConfirmID.value) {
+    flash('请先完成当前邮箱的删除确认', true)
+    return
+  }
+  if (isMailboxDeleteBusy(mailbox.id)) {
+    flash(`${mailbox.email} 已在删除队列中`, true)
+    return
+  }
+  deleteConfirmID.value = mailbox.id
+  try {
+    const confirmed = await confirmAction({
+      title: '彻底删除隐私邮箱',
+      message: `将从 Apple 服务器彻底删除 ${mailbox.email}，确认远端不存在后再删除本地记录和邮件。此操作不可恢复，继续吗？`,
+      confirmText: '确认彻底删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
+    if (!deleteQueueRunning) {
+      deleteSucceeded = 0
+      deleteFailed = 0
+      deleteLastError = ''
+    }
+    deleteQueue.value.push({ id: mailbox.id, email: mailbox.email })
+    updateDeleteProgress()
+    void processDeleteQueue()
+  } finally {
+    deleteConfirmID.value = ''
   }
 }
 
@@ -445,6 +631,7 @@ function handlePageKeydown(event) {
   if (event.key !== 'Escape') return
   if (selectedMessage.value) selectedMessage.value = null
   else if (codeDialogOpen.value) closeCodeDialog()
+  else if (quickEditOpen.value) closeQuickEdit()
   else if (selected.value) selected.value = null
 }
 
@@ -454,8 +641,8 @@ watch(query, () => {
 })
 watch(accountID, () => { page.value = 1; load() })
 watch(status, () => { page.value = 1; load() })
-watch([selected, codeDialogOpen], ([mailbox, codeOpen]) => {
-  document.body.style.overflow = mailbox || codeOpen ? 'hidden' : ''
+watch([selected, codeDialogOpen, quickEditOpen], ([mailbox, codeOpen, quickEditOpenValue]) => {
+  document.body.style.overflow = mailbox || codeOpen || quickEditOpenValue ? 'hidden' : ''
 })
 watch(selected, (value) => {
   if (!value) selectedMessage.value = null
@@ -517,32 +704,33 @@ onBeforeUnmount(() => {
       <div v-if="!loading && !result.items?.length" class="mailbox-list-viewport flex flex-col items-center justify-center gap-3 text-center"><div class="rounded-2xl bg-slate-100 p-4 text-slate-400 dark:bg-slate-700"><Boxes :size="31" /></div><div class="font-bold">没有符合条件的邮箱</div><div class="text-sm text-slate-400">从 Apple 账号页创建或同步隐私邮箱后会显示在这里。</div></div>
       <template v-else>
         <div class="mailbox-list-viewport mailbox-list-scroll">
-          <table class="w-full min-w-[1120px] table-fixed text-left text-sm">
+          <table class="w-full min-w-[1230px] table-fixed text-left text-sm">
             <colgroup>
               <col class="w-[240px]" />
-              <col class="w-[120px]" />
+              <col class="w-[150px]" />
               <col class="w-[90px]" />
               <col class="w-[150px]" />
               <col class="w-[70px]" />
               <col class="w-[170px]" />
-              <col class="w-[280px]" />
+              <col class="w-[360px]" />
             </colgroup>
             <thead class="sticky top-0 z-10 bg-slate-50 text-xs text-slate-400 shadow-[0_1px_0_rgba(148,163,184,0.18)] dark:bg-slate-900">
-              <tr><th class="px-4 py-3 font-semibold">邮箱</th><th class="px-3 py-3 font-semibold">标签</th><th class="px-3 py-3 font-semibold">状态</th><th class="px-3 py-3 font-semibold">API / iCloud</th><th class="px-3 py-3 font-semibold">收件</th><th class="px-3 py-3 font-semibold">最近同步</th><th class="px-3 py-3 text-right font-semibold">操作</th></tr>
+              <tr><th class="px-4 py-3 font-semibold">邮箱</th><th class="px-3 py-3 text-center font-semibold">标签/备注</th><th class="px-3 py-3 text-center font-semibold">状态</th><th class="px-3 py-3 text-center font-semibold">API / iCloud</th><th class="px-3 py-3 text-center font-semibold">收件</th><th class="px-3 py-3 text-center font-semibold">最近同步</th><th class="px-3 py-3 text-right font-semibold">操作</th></tr>
             </thead>
             <tbody class="divide-y divide-slate-100 dark:divide-slate-700">
               <tr v-for="mailbox in result.items" :key="mailbox.id" class="hover:bg-emerald-50/30 dark:hover:bg-slate-700/30">
-                <td class="px-4 py-4"><div class="truncate font-semibold" :title="mailbox.email">{{ mailbox.email }}</div><div class="mt-1 truncate font-mono text-[11px] text-slate-400" :title="mailbox.id">{{ mailbox.id }}</div></td>
-                <td class="truncate px-3 py-4 text-slate-500 dark:text-slate-300" :title="mailbox.label || '-'">{{ mailbox.label || '-' }}</td>
-                <td class="px-3 py-4"><span :class="statusClass(mailbox.status)" class="rounded-full px-2.5 py-1 text-xs font-bold">{{ statusLabel(mailbox.status) }}</span></td>
-                <td class="px-3 py-4"><div class="flex gap-1.5"><span :class="mailbox.api_active ? 'text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40' : 'text-slate-400 bg-slate-100 dark:bg-slate-700'" class="rounded-lg px-2 py-1 text-[11px] font-bold">API</span><span :class="mailbox.icloud_active ? 'text-sky-600 bg-sky-50 dark:bg-sky-950/40' : 'text-slate-400 bg-slate-100 dark:bg-slate-700'" class="rounded-lg px-2 py-1 text-[11px] font-bold">iCloud</span></div></td>
-                <td class="px-3 py-4 font-mono text-slate-500">{{ mailbox.receive_count || 0 }}</td>
-                <td class="whitespace-nowrap px-3 py-4 text-xs text-slate-400">{{ formatTime(mailbox.last_sync_at) }}</td>
+                <td class="px-4 py-4"><button type="button" class="block max-w-full truncate text-left font-semibold transition hover:text-emerald-600 dark:hover:text-emerald-300" :title="`点击复制邮箱：${mailbox.email}`" @click.stop="copyMailboxEmail(mailbox)">{{ mailbox.email }}</button><div class="mt-1 truncate font-mono text-[11px] text-slate-400" :title="mailbox.id">{{ mailbox.id }}</div></td>
+                <td class="px-3 py-3 text-center"><div class="truncate font-semibold text-slate-600 dark:text-slate-200" :title="mailbox.label || '-'">{{ mailbox.label || '-' }}</div><button type="button" class="mt-1 max-w-full truncate text-xs text-slate-400 transition hover:text-emerald-600 hover:underline dark:hover:text-emerald-300" :title="mailbox.note ? `点击修改备注：${mailbox.note}` : '点击添加备注'" @click.stop="openQuickEdit(mailbox, 'note')">{{ mailbox.note || '添加备注' }}</button></td>
+                <td class="px-3 py-4 text-center"><button type="button" :class="statusClass(mailbox.status)" class="rounded-full px-2.5 py-1 text-xs font-bold transition hover:ring-2 hover:ring-emerald-400/40" title="点击修改邮箱状态" @click.stop="openQuickEdit(mailbox, 'status')">{{ statusLabel(mailbox.status) }}</button></td>
+                <td class="px-3 py-4"><div class="flex justify-center gap-1.5"><span :class="mailbox.api_active ? 'text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40' : 'text-slate-400 bg-slate-100 dark:bg-slate-700'" class="rounded-lg px-2 py-1 text-[11px] font-bold">API</span><span :class="mailbox.icloud_active ? 'text-sky-600 bg-sky-50 dark:bg-sky-950/40' : 'text-slate-400 bg-slate-100 dark:bg-slate-700'" class="rounded-lg px-2 py-1 text-[11px] font-bold">iCloud</span></div></td>
+                <td class="px-3 py-4 text-center font-mono text-slate-500">{{ mailbox.receive_count || 0 }}</td>
+                <td class="whitespace-nowrap px-3 py-4 text-center text-xs text-slate-400">{{ formatTime(mailbox.last_sync_at) }}</td>
                 <td class="px-3 py-3">
                   <div class="flex justify-end gap-1.5">
-                    <button class="secondary-button whitespace-nowrap px-2.5 py-1.5 text-xs" :disabled="Boolean(busy)" title="同步该邮箱的最新邮件" @click.stop="quickSyncMailbox(mailbox)"><LoaderCircle v-if="busy === `sync-row:${mailbox.id}`" :size="13" class="animate-spin" /><RefreshCw v-else :size="13" />同步</button>
-                    <button class="secondary-button whitespace-nowrap px-2.5 py-1.5 text-xs" :disabled="Boolean(busy)" title="获取该邮箱的最新验证码" @click.stop="quickGetCode(mailbox)"><LoaderCircle v-if="codeBusyVisible === `code-row:${mailbox.id}`" :size="13" class="animate-spin" /><KeyRound v-else :size="13" />取码</button>
-                    <button class="secondary-button whitespace-nowrap px-2.5 py-1.5 text-xs" :disabled="Boolean(busy)" title="查看邮箱详情" @click.stop="openMailbox(mailbox)"><LoaderCircle v-if="busy === `detail:${mailbox.id}`" :size="13" class="animate-spin" /><MailOpen v-else :size="13" />详情</button>
+                    <button class="mailbox-action-button mailbox-action-sync" :class="{ 'mailbox-action-sync-selected': busy === `sync-row:${mailbox.id}` }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" title="同步该邮箱的最新邮件" @click.stop="quickSyncMailbox(mailbox)"><LoaderCircle v-if="busy === `sync-row:${mailbox.id}`" :size="13" class="animate-spin" /><RefreshCw v-else :size="13" />同步</button>
+                    <button class="mailbox-action-button mailbox-action-code" :class="{ 'mailbox-action-code-selected': busy === `code-row:${mailbox.id}` || (codeDialogOpen && codeMailbox?.id === mailbox.id) }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" title="获取该邮箱的最新验证码" @click.stop="quickGetCode(mailbox)"><LoaderCircle v-if="codeBusyVisible === `code-row:${mailbox.id}`" :size="13" class="animate-spin" /><KeyRound v-else :size="13" />取码</button>
+                    <button class="mailbox-action-button mailbox-action-detail" :class="{ 'mailbox-action-detail-selected': selected?.id === mailbox.id }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" title="查看邮箱详情" @click.stop="openMailbox(mailbox)"><LoaderCircle v-if="busy === `detail:${mailbox.id}`" :size="13" class="animate-spin" /><MailOpen v-else :size="13" />详情</button>
+                    <button class="mailbox-action-button mailbox-action-delete" :class="{ 'mailbox-action-delete-selected': isMailboxDeleteBusy(mailbox.id) }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" :title="deletingMailboxID === mailbox.id ? '正在从 Apple 服务器和本地彻底删除' : isMailboxDeleteQueued(mailbox.id) ? '已加入彻底删除队列' : '从 Apple 服务器和本地彻底删除该邮箱'" @click.stop="removeMailboxFromRow(mailbox)"><LoaderCircle v-if="deletingMailboxID === mailbox.id" :size="13" class="animate-spin" /><LoaderCircle v-else-if="isMailboxDeleteQueued(mailbox.id)" :size="13" class="animate-spin" /><Trash2 v-else :size="13" />{{ deletingMailboxID === mailbox.id ? '删除中' : isMailboxDeleteQueued(mailbox.id) ? '排队中' : '删除' }}</button>
                   </div>
                 </td>
               </tr>
@@ -552,6 +740,11 @@ onBeforeUnmount(() => {
       </template>
       <div v-if="result.items?.length || !loading" class="flex items-center justify-between border-t border-slate-100 px-5 py-3 dark:border-slate-700"><span class="text-xs text-slate-400">第 {{ result.page }} / {{ result.total_pages }} 页</span><div class="flex gap-2"><button class="secondary-button px-3 py-2" :disabled="loading || result.page <= 1" title="上一页" @click="move(-1)"><ChevronLeft :size="16" /></button><button class="secondary-button px-3 py-2" :disabled="loading || result.page >= result.total_pages" title="下一页" @click="move(1)"><ChevronRight :size="16" /></button></div></div>
     </section>
+
+    <FormDialog :open="quickEditOpen" :title="quickEditTitle" :description="quickEditMailbox?.email || ''" :busy="busy === 'quick-edit'" @close="closeQuickEdit" @submit="saveQuickEdit">
+      <label v-if="quickEditField === 'note'" class="form-group"><span class="form-label">备注</span><textarea v-model="quickEdit.note" class="field min-h-24 resize-none" maxlength="1000" placeholder="请输入邮箱备注，留空可清除备注" autofocus /></label>
+      <div v-else class="form-group"><span class="form-label">邮箱状态</span><CardSelect v-model="quickEdit.status" :options="mailboxDetailStatusOptions" aria-label="邮箱状态" /></div>
+    </FormDialog>
 
     <div v-if="selected" class="fixed inset-0 z-40 !m-0 flex items-center justify-center bg-slate-950/55 p-3 backdrop-blur-[3px] sm:p-5" role="presentation" @click.stop>
       <aside class="max-h-[calc(100vh-1.5rem)] w-full max-w-2xl overflow-y-auto rounded-2xl border border-slate-200 bg-slate-50 shadow-2xl dark:border-slate-700 dark:bg-slate-950 sm:max-h-[calc(100vh-2.5rem)]" role="dialog" aria-modal="true" aria-labelledby="mailbox-detail-title">
