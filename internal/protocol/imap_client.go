@@ -457,7 +457,7 @@ func CheckICloudIMAPLogin(ctx context.Context, email, appPassword string) error 
 	return nil
 }
 
-func WatchICloudIMAPExists(ctx context.Context, state LoginState, onExists func()) error {
+func WatchICloudIMAPExists(ctx context.Context, state LoginState, onReady, onExists func()) error {
 	state, err := normalizeICloudIMAPState(state)
 	if err != nil {
 		return err
@@ -501,6 +501,9 @@ func WatchICloudIMAPExists(ctx context.Context, state LoginState, onExists func(
 	}
 	if !imapTaggedOK(selectLines, "A002") {
 		return errCode("imap_select_failed", "打开 iCloud 收件箱失败："+imapResponseSummary(selectLines), true)
+	}
+	if onReady != nil {
+		onReady()
 	}
 
 	tagIndex := 3

@@ -5,14 +5,20 @@ import (
 	"time"
 )
 
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 const (
 	StatusActive    = "active"
 	StatusAvailable = "available"
+	StatusReserved  = "reserved"
 	StatusUsed      = "used"
 	StatusFailed    = "failed"
 	StatusDisabled  = "disabled"
+
+	MailboxLeaseClaimed   = "claimed"
+	MailboxLeaseCommitted = "committed"
+	MailboxLeaseReleased  = "released"
+	MailboxLeaseExpired   = "expired"
 
 	ICloudStatusActive       = "active"
 	ICloudStatusNeedLogin    = "need_login"
@@ -33,6 +39,7 @@ type State struct {
 	Sessions            []WebSession      `json:"sessions,omitempty"`
 	AppleAccounts       []AppleAccount    `json:"apple_accounts,omitempty"`
 	Mailboxes           []Mailbox         `json:"mailboxes,omitempty"`
+	MailboxLeases       []MailboxLease    `json:"mailbox_leases,omitempty"`
 	Messages            []Message         `json:"messages,omitempty"`
 	Events              []Event           `json:"events,omitempty"`
 	Settings            Settings          `json:"settings"`
@@ -86,12 +93,31 @@ type Mailbox struct {
 	ReceiveCount      int       `json:"receive_count"`
 	Status            string    `json:"status"`
 	Note              string    `json:"note"`
+	ActiveLeaseID     string    `json:"active_lease_id,omitempty"`
 	LastSyncAt        time.Time `json:"last_sync_at,omitempty"`
 	LastSyncUID       string    `json:"last_sync_uid,omitempty"`
 	LastCodeMessageID string    `json:"last_code_message_id,omitempty"`
 	LastCodeAt        time.Time `json:"last_code_at,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// MailboxLease 记录外部调用方对邮箱的临时占用，只有提交租约才会把邮箱标记为已使用。
+type MailboxLease struct {
+	ID          string    `json:"id"`
+	MailboxID   string    `json:"mailbox_id"`
+	Email       string    `json:"email"`
+	Project     string    `json:"project"`
+	Purpose     string    `json:"purpose,omitempty"`
+	RequestID   string    `json:"request_id,omitempty"`
+	State       string    `json:"state"`
+	Note        string    `json:"note,omitempty"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	CommittedAt time.Time `json:"committed_at,omitempty"`
+	ReleasedAt  time.Time `json:"released_at,omitempty"`
+	ExpiredAt   time.Time `json:"expired_at,omitempty"`
 }
 
 type Message struct {

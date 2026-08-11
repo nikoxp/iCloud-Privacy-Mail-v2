@@ -29,6 +29,9 @@ type Config struct {
 	MailWatcherLookbackHours           int    `json:"mail_watcher_lookback_hours"`
 	PublicFastSyncWaitMS               int    `json:"public_fast_sync_wait_ms"`
 	PublicSyncMinIntervalMS            int    `json:"public_sync_min_interval_ms"`
+	PublicMailboxLeaseTTLMinutes       int    `json:"public_mailbox_lease_ttl_minutes"`
+	PublicMailboxLeaseMaxTTLMinutes    int    `json:"public_mailbox_lease_max_ttl_minutes"`
+	PublicMailboxLeaseSweepSeconds     int    `json:"public_mailbox_lease_sweep_seconds"`
 	UpdateEnabled                      bool   `json:"update_enabled"`
 	UpdateRepository                   string `json:"update_repository"`
 }
@@ -52,6 +55,9 @@ func Default() Config {
 		MailWatcherLookbackHours:           24,
 		PublicFastSyncWaitMS:               600,
 		PublicSyncMinIntervalMS:            3000,
+		PublicMailboxLeaseTTLMinutes:       30,
+		PublicMailboxLeaseMaxTTLMinutes:    7 * 24 * 60,
+		PublicMailboxLeaseSweepSeconds:     30,
 		UpdateEnabled:                      true,
 		UpdateRepository:                   "xiuxiu56/iCloud-Privacy-Mail-v2",
 	}
@@ -127,6 +133,18 @@ func Load(path string) (Config, error) {
 	}
 	if incoming.PublicSyncMinIntervalMS > 0 {
 		cfg.PublicSyncMinIntervalMS = incoming.PublicSyncMinIntervalMS
+	}
+	if incoming.PublicMailboxLeaseTTLMinutes > 0 {
+		cfg.PublicMailboxLeaseTTLMinutes = incoming.PublicMailboxLeaseTTLMinutes
+	}
+	if incoming.PublicMailboxLeaseMaxTTLMinutes > 0 {
+		cfg.PublicMailboxLeaseMaxTTLMinutes = incoming.PublicMailboxLeaseMaxTTLMinutes
+	}
+	if incoming.PublicMailboxLeaseSweepSeconds > 0 {
+		cfg.PublicMailboxLeaseSweepSeconds = incoming.PublicMailboxLeaseSweepSeconds
+	}
+	if cfg.PublicMailboxLeaseMaxTTLMinutes < cfg.PublicMailboxLeaseTTLMinutes {
+		cfg.PublicMailboxLeaseMaxTTLMinutes = cfg.PublicMailboxLeaseTTLMinutes
 	}
 	if _, ok := raw["apple_account_keep_alive_enabled"]; ok {
 		cfg.AppleAccountKeepAliveEnabled = incoming.AppleAccountKeepAliveEnabled

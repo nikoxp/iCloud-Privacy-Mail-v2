@@ -136,6 +136,48 @@ func TestRunAppleKeepAliveChecksImmediately(t *testing.T) {
 	}
 }
 
+func TestMailWatcherSettingTakesEffectWithoutRestart(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("创建测试状态失败：%v", err)
+	}
+	cfg := config.Default()
+	server := New(cfg, state, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	server.StartBackground(ctx)
+	t.Cleanup(cancel)
+
+	waitForWatcherStatus(t, server, func(status bool, enabled bool, groups int) bool {
+		return status && !enabled && groups == 0
+	})
+	settings := state.Settings()
+	settings.EnableMailWatcher = true
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("开启测试邮件监听失败：%v", err)
+	}
+	server.watcher.Wake("")
+	waitForWatcherStatus(t, server, func(status bool, enabled bool, groups int) bool {
+		return status && enabled && groups == 0
+	})
+
+	cancel()
+	waitForWatcherStatus(t, server, func(status bool, _ bool, _ int) bool { return !status })
+}
+
+func waitForWatcherStatus(t *testing.T, server *Server, match func(running bool, enabled bool, groups int) bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		status := server.watcher.Snapshot()
+		if match(status.Running, status.Enabled, status.GroupCount) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	status := server.watcher.Snapshot()
+	t.Fatalf("等待邮件监听状态超时：%+v", status)
+}
+
 func assertKeepAliveEvent(t *testing.T, state *store.Store, text string) {
 	t.Helper()
 	for _, event := range state.Dashboard().Events {

@@ -37,18 +37,20 @@ function taskIcon(task) {
 }
 
 function taskStatusText(status) {
-  return ({ completed: '已就绪', running: '运行中', creating: '创建中', waiting: '等待中', stopped: '已停止', idle: '未启动', planned: '待启用' })[status] || status
+  return ({ completed: '已就绪', running: '运行中', starting: '启动中', creating: '创建中', waiting: '等待条件', failed: '运行异常', stopped: '已停止', idle: '未启动', planned: '待启用' })[status] || status
 }
 
 function taskStatusClass(status) {
   if (status === 'running' || status === 'creating') return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-200'
-  if (status === 'completed' || status === 'waiting') return 'bg-sky-100 text-sky-700 dark:bg-sky-950/60 dark:text-sky-200'
+  if (status === 'failed') return 'bg-rose-100 text-rose-700 dark:bg-rose-950/60 dark:text-rose-200'
+  if (status === 'completed' || status === 'waiting' || status === 'starting') return 'bg-sky-100 text-sky-700 dark:bg-sky-950/60 dark:text-sky-200'
   return 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-300'
 }
 
 function taskIconClass(status) {
   if (status === 'running' || status === 'creating') return 'bg-emerald-100 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-300'
-  if (status === 'completed' || status === 'waiting') return 'bg-sky-100 text-sky-600 dark:bg-sky-950/60 dark:text-sky-300'
+  if (status === 'failed') return 'bg-rose-100 text-rose-600 dark:bg-rose-950/60 dark:text-rose-300'
+  if (status === 'completed' || status === 'waiting' || status === 'starting') return 'bg-sky-100 text-sky-600 dark:bg-sky-950/60 dark:text-sky-300'
   return 'bg-slate-100 text-slate-400 dark:bg-slate-700 dark:text-slate-300'
 }
 

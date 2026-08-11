@@ -11,7 +11,7 @@
 - 隐私邮箱创建、同步、导入、筛选、状态、远端清理和远端删除。
 - 邮箱池支持点击邮箱复制、标签/备注双行展示、备注与状态快捷编辑，以及带二次确认的串行删除队列。
 - 单次创建与多账号自动创建，默认生成 `x_1`、`x_2` 等连续标签。
-- 公共取号 API、邮箱独立取码 API、独立公共验证码页面。
+- 公共取号租约 API、邮箱独立取码 API、独立公共验证码页面；邮箱只在租约提交后标记为已使用。
 - 运行数据、邮件、邮箱地址和取码 API 本地导出。
 - GitHub Release/默认分支版本检查、侧栏版本展示和顶部公告中心。
 - 单管理员登录保护；无多用户注册和 `/manage` 页面。
@@ -127,7 +127,7 @@ iCloud-Privacy-Mail-v2/
 │   ├── mailwatcher/         # IMAP IDLE 和批量同步
 │   ├── scheduler/           # 自动创建调度
 │   ├── protocol/            # Apple、iCloud、IMAP 协议客户端
-│   ├── store/               # schema 3 JSON 状态存储
+│   ├── store/               # schema 4 JSON 状态存储和邮箱租约
 │   ├── updatecheck/         # GitHub 版本检查与项目公告
 │   ├── httpapi/             # 管理 API、公共 API 和导出
 │   └── webui/               # Go 嵌入式前端资源
@@ -152,7 +152,23 @@ iCloud-Privacy-Mail-v2/
   -target data/state.json
 ```
 
-迁移工具会导入管理员、Apple 账号、邮箱、邮件、创建设置和 Apple 登录态，并升级到 schema 3。旧 Web 会话不会迁移，迁移后需要重新登录。覆盖已存在目标时先备份，再增加 `-force`。
+迁移工具会导入管理员、Apple 账号、邮箱、邮件、创建设置和 Apple 登录态，并升级到 schema 4。旧 Web 会话不会迁移，迁移后需要重新登录。覆盖已存在目标时先备份，再增加 `-force`。
+
+## 公共邮箱租约
+
+`POST /api/v1/mailboxes/claim` 现在执行 `available → reserved`，响应同时返回 `mailbox` 和 `lease`。调用方应为每个业务请求发送稳定的 `request_id`，服务会按 `project + request_id` 返回同一租约，避免领取响应超时后重复消耗邮箱。
+
+注册结果对应动作：
+
+```text
+注册成功       POST /api/v1/mailbox-leases/{lease_id}/commit
+注册失败       POST /api/v1/mailbox-leases/{lease_id}/release
+等待人工确认   POST /api/v1/mailbox-leases/{lease_id}/renew
+更新备注       POST /api/v1/mailbox-leases/{lease_id}/note
+查询租约       GET  /api/v1/mailbox-leases/{lease_id}?project=PROJECT
+```
+
+`commit` 才会执行 `reserved → used`；`release` 和超时回收会恢复为 `available`。动作请求均需提交全局 API Key 和 `project`。`claim`、`commit`、`release` 支持幂等重试，备注使用 `note` 字段。旧版按邮箱调用的 `/api/v1/mailboxes/{email}/commit|release|renew` 继续作为兼容入口。
 
 ## 数据与安全
 

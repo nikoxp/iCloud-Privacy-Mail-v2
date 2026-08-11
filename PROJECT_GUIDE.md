@@ -282,8 +282,19 @@ go run main.go
 curl -X POST 'https://HOST/api/v1/mailboxes/claim' \
   -H 'Content-Type: application/json' \
   -H 'X-API-Key: TOKEN' \
-  -d '{"project":"PROJECT","purpose":"PURPOSE"}'
+  -d '{"project":"PROJECT","purpose":"PURPOSE","request_id":"REQUEST_ID","note":"备注"}'
 ```
+
+领取成功后邮箱状态为 `reserved`，响应中的 `data.lease.id` 是后续状态变更凭据。注册成功后提交租约：
+
+```bash
+curl -X POST 'https://HOST/api/v1/mailbox-leases/LEASE_ID/commit' \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: TOKEN' \
+  -d '{"project":"PROJECT","note":"注册成功"}'
+```
+
+注册失败时把 `commit` 换成 `release`；密码已接受、需要人工审核时调用 `renew` 并按需传入 `ttl_seconds`。`request_id` 在同一项目内幂等，领取请求超时后应使用原值重试。
 
 按邮箱独立 Token 取码：
 
@@ -365,6 +376,14 @@ GET  /api/v1/health
 POST /api/v1/mailboxes/claim
 POST /api/v1/mailboxes/lookup
 GET  /api/v1/mailboxes/{email}/code
+GET  /api/v1/mailbox-leases/{lease_id}?project={project}
+POST /api/v1/mailbox-leases/{lease_id}/commit
+POST /api/v1/mailbox-leases/{lease_id}/release
+POST /api/v1/mailbox-leases/{lease_id}/renew
+POST /api/v1/mailbox-leases/{lease_id}/note
+POST /api/v1/mailboxes/{email}/commit
+POST /api/v1/mailboxes/{email}/release
+POST /api/v1/mailboxes/{email}/renew
 GET  /api/v1/public-code/status
 GET  /api/v1/public-code?email={email}
 ```
@@ -404,6 +423,9 @@ GET  /api/v1/public-code?email={email}
 | `mail_watcher_lookback_hours` | `24` | 首次监听回看小时数 |
 | `public_fast_sync_wait_ms` | `600` | 公共取码快速同步等待时间 |
 | `public_sync_min_interval_ms` | `3000` | 同一邮箱公共同步最短间隔 |
+| `public_mailbox_lease_ttl_minutes` | `30` | 新领取邮箱的默认租约分钟数 |
+| `public_mailbox_lease_max_ttl_minutes` | `10080` | 单次领取或续期允许的最长分钟数 |
+| `public_mailbox_lease_sweep_seconds` | `30` | 过期租约后台扫描间隔 |
 | `update_enabled` | `true` | 是否启用 GitHub 版本与项目公告检查 |
 | `update_repository` | `xiuxiu56/iCloud-Privacy-Mail-v2` | 检查 Release、默认分支提交和公告文件的仓库 |
 
@@ -415,12 +437,12 @@ chmod 600 config.json
 
 ## 7. 数据存储与迁移
 
-状态默认保存在 `data/state.json`，schema 版本为 3，主要内容包括：
+状态默认保存在 `data/state.json`，schema 版本为 4，主要内容包括：
 
 - 管理员密码摘要和控制台会话摘要。
 - Apple 账号、iCloud Web Cookie、Apple Account 登录态。
 - IMAP 邮箱、App 专用密码和同步游标。
-- 隐私邮箱、邮箱 API Token、使用状态和备注。
+- 隐私邮箱、邮箱 API Token、使用状态、备注和持久化租约。
 - 本地邮件、最近验证码、系统事件和设置。
 
 保存时使用同目录临时文件、`fsync` 和原子重命名；状态文件权限设为 `0600`，目录权限设为 `0700`。
@@ -448,7 +470,7 @@ iCloud-Privacy-Mail-v2/
 │   ├── auth/service.go             # 单管理员、密码摘要、控制台会话
 │   ├── buildinfo/buildinfo.go      # 二进制版本、提交、构建时间和平台
 │   ├── config/config.go            # 默认配置与 JSON 加载
-│   ├── domain/model.go             # schema 3 领域模型
+│   ├── domain/model.go             # schema 4 领域模型
 │   ├── apple/service.go            # Apple 登录、2FA、检测、IMAP 和保活
 │   ├── mailbox/service.go          # 邮箱创建、同步、取码、清理和删除
 │   ├── mailwatcher/service.go      # IMAP IDLE、批量同步和重连

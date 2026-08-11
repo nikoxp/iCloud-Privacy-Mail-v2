@@ -72,6 +72,7 @@ func (s *Store) load() error {
 func (s *Store) normalizeLocked() {
 	s.state.SchemaVersion = domain.SchemaVersion
 	s.migrateLegacyICloudSessionsLocked()
+	s.normalizeMailboxLeasesLocked(time.Now())
 	if s.state.NextID <= 0 {
 		s.state.NextID = 1
 	}
@@ -130,6 +131,9 @@ func (s *Store) ensureNextIDLocked() {
 	}
 	for _, mailbox := range s.state.Mailboxes {
 		consider(mailbox.ID)
+	}
+	for _, lease := range s.state.MailboxLeases {
+		consider(lease.ID)
 	}
 	for _, message := range s.state.Messages {
 		consider(message.ID)

@@ -16,12 +16,20 @@ import (
 )
 
 type Service struct {
-	cfg      config.Config
-	store    *store.Store
-	client   *protocol.ICloudClient
-	createMu sync.Mutex
-	syncMu   sync.Mutex
-	syncs    map[string]*syncCall
+	cfg          config.Config
+	store        *store.Store
+	client       *protocol.ICloudClient
+	deleteClient remoteMailboxDeleteClient
+	createMu     sync.Mutex
+	syncMu       sync.Mutex
+	syncs        map[string]*syncCall
+}
+
+type remoteMailboxDeleteClient interface {
+	ListPrivacyMailboxes(context.Context, protocol.ICloudSession) ([]protocol.ICloudRemoteMailbox, error)
+	DeletePrivacyMailbox(context.Context, protocol.ICloudSession, string) error
+	MoveRemoteMessagesToTrash(context.Context, protocol.ICloudSession, []string) (protocol.ICloudMailCleanupResult, error)
+	EmptyTrash(context.Context, protocol.ICloudSession) (int, error)
 }
 
 const mailboxCodeFreshWindow = 5 * time.Minute
@@ -69,7 +77,8 @@ type RemoteCleanupBatchResult struct {
 }
 
 func NewService(cfg config.Config, state *store.Store) *Service {
-	return &Service{cfg: cfg, store: state, client: protocol.NewICloudClient(), syncs: make(map[string]*syncCall)}
+	client := protocol.NewICloudClient()
+	return &Service{cfg: cfg, store: state, client: client, deleteClient: client, syncs: make(map[string]*syncCall)}
 }
 
 // ImportLocal 把已有隐私邮箱绑定到 Apple 账号，不调用 Apple 创建接口。
@@ -153,17 +162,24 @@ func (s *Service) DeleteRemote(ctx context.Context, mailboxID string) error {
 	if !ok {
 		return errors.New("对应 Apple 账号登录态不存在")
 	}
-	remotes, err := s.client.ListPrivacyMailboxes(ctx, session)
+	if err := s.cleanupMailboxMessagesBeforeDelete(ctx, mailboxID, session); err != nil {
+		return err
+	}
+	client := s.deleteClient
+	if client == nil {
+		client = s.client
+	}
+	remotes, err := client.ListPrivacyMailboxes(ctx, session)
 	if err != nil {
 		return err
 	}
 	remote, exists := matchRemote(remotes, mailbox.AnonymousID, mailbox.Email)
 	if exists {
-		if err := s.client.DeletePrivacyMailbox(ctx, session, remote.AnonymousID); err != nil {
+		if err := client.DeletePrivacyMailbox(ctx, session, remote.AnonymousID); err != nil {
 			return err
 		}
 	}
-	confirmed, err := s.client.ListPrivacyMailboxes(ctx, session)
+	confirmed, err := client.ListPrivacyMailboxes(ctx, session)
 	if err != nil {
 		return fmt.Errorf("Apple 删除后确认失败：%w", err)
 	}
@@ -174,7 +190,28 @@ func (s *Service) DeleteRemote(ctx context.Context, mailboxID string) error {
 }
 
 func (s *Service) DeleteLocal(mailboxID string) error {
+	if _, err := s.store.DeleteMailboxMessages(mailboxID); err != nil {
+		return fmt.Errorf("删除邮箱前清理本地邮件失败：%w", err)
+	}
 	return s.store.DeleteMailbox(mailboxID)
+}
+
+func (s *Service) cleanupMailboxMessagesBeforeDelete(ctx context.Context, mailboxID string, session protocol.ICloudSession) error {
+	client := s.deleteClient
+	if client == nil {
+		client = s.client
+	}
+	remoteIDs := remoteMessageIDs(s.store.MessagesForMailbox(mailboxID))
+	if _, err := client.MoveRemoteMessagesToTrash(ctx, session, remoteIDs); err != nil {
+		return fmt.Errorf("删除邮箱前清理 Apple 远端邮件失败：%w", err)
+	}
+	if _, err := client.EmptyTrash(ctx, session); err != nil {
+		return fmt.Errorf("删除邮箱前清空 Apple 废纸篓失败：%w", err)
+	}
+	if _, err := s.store.DeleteMailboxMessages(mailboxID); err != nil {
+		return fmt.Errorf("删除邮箱前清理本地邮件失败：%w", err)
+	}
+	return nil
 }
 
 func (s *Service) CleanRemoteMessages(ctx context.Context, mailboxID string, options RemoteCleanupOptions) (protocol.ICloudMailCleanupResult, error) {

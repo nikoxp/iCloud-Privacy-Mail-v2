@@ -10,7 +10,7 @@
 2. 把 Go 单体拆成配置、领域模型、存储、认证、协议、Apple 服务、邮箱服务、后台监听、调度器、HTTP API 和嵌入式 Web UI。
 3. 用 Vue 3 + Vue Router 重建页面，借鉴 `vue_demo` 的布局语言，补上登录守卫、移动端侧栏、暗色模式和实际操作反馈。
 4. 单管理员首次设置：管理员密码使用 PBKDF2-SHA256 保存，登录态使用随机 Token 的 SHA-256 摘要，Cookie 为 HttpOnly + SameSite Strict。
-5. 状态迁移升级到 schema 3，保存 `create_settings`、owner 字段、同步 UID、验证码去重字段和 typed Apple 登录态；旧 Web 会话不迁移。
+5. 状态迁移升级到 schema 4，保存 `create_settings`、owner 字段、同步 UID、验证码去重字段、typed Apple 登录态和邮箱租约；旧 Web 会话不迁移。
 6. `/manage`、`/manage/` 固定返回 404；前端所有入口均位于默认控制台。
 7. Apple Account / iCloud Web 登录、2FA、登录态检查、IMAP App 专用密码验证、隐私邮箱创建/同步/删除、手动导入和远端邮件清理已接入。
 8. 根目录 `main.go` 是统一主入口；无参数运行时提供中文启动菜单，也支持配置、地址、端口和数据文件参数。`mailwatcher` 使用按 Apple 账号分组的批量同步、IMAP IDLE、UID 起点、主动取码唤醒和断线退避重连。
@@ -32,7 +32,7 @@
 
 ### P0 数据基座
 
-- `domain.SchemaVersion = 3`。
+- `domain.SchemaVersion = 4`。
 - `cmd/migrate` 会输出旧用户、登录态和孤立邮箱数量。
 - 创建配置、owner、同步游标、验证码去重和 typed `ICloudSession` / `LoginState` 均保留。
 

@@ -135,6 +135,7 @@ func (s *Store) DeleteAppleAccount(id string) (DeleteAppleAccountResult, error) 
 		if mailbox.AccountID == id {
 			result.Mailboxes++
 			deletedMailboxIDs[mailbox.ID] = struct{}{}
+			s.closeMailboxLeasesForDeletionLocked(mailbox.ID, time.Now(), "Apple 账号已由管理员删除")
 			continue
 		}
 		mailboxes = append(mailboxes, mailbox)

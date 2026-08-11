@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"icloud-privacy-mail-v2/internal/domain"
 	mailboxservice "icloud-privacy-mail-v2/internal/mailbox"
 	"icloud-privacy-mail-v2/internal/scheduler"
+	"icloud-privacy-mail-v2/internal/store"
 )
 
 const publicCodePageContextKey contextKey = "public-code-page"
@@ -36,12 +38,16 @@ func (s *Server) handlePublicHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
 		"data": map[string]any{
-			"service":       "icloud-privacy-mail-v2",
-			"version":       current.Version,
-			"commit":        current.Commit,
-			"api_active":    s.store.Settings().EnablePublicMailboxAPI && s.globalAPIKey() != "",
-			"icloud_active": active,
-			"time":          time.Now().Format(time.RFC3339),
+			"service":                    "icloud-privacy-mail-v2",
+			"version":                    current.Version,
+			"commit":                     current.Commit,
+			"api_active":                 s.store.Settings().EnablePublicMailboxAPI && s.globalAPIKey() != "",
+			"icloud_active":              active,
+			"lease_api_version":          1,
+			"lease_ttl_seconds":          s.cfg.PublicMailboxLeaseTTLMinutes * 60,
+			"lease_max_ttl_seconds":      s.cfg.PublicMailboxLeaseMaxTTLMinutes * 60,
+			"mailbox_note_api_supported": true,
+			"time":                       time.Now().Format(time.RFC3339),
 		},
 	})
 }
@@ -56,8 +62,11 @@ func (s *Server) handlePublicClaimMailbox(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var body struct {
-		Project string `json:"project"`
-		Purpose string `json:"purpose"`
+		Project    string `json:"project"`
+		Purpose    string `json:"purpose"`
+		RequestID  string `json:"request_id"`
+		Note       string `json:"note"`
+		TTLSeconds int    `json:"ttl_seconds"`
 	}
 	if r.ContentLength != 0 {
 		if err := decodeJSON(r, &body); err != nil {
@@ -65,18 +74,28 @@ func (s *Server) handlePublicClaimMailbox(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	note := strings.TrimSpace(strings.TrimSpace(body.Project) + " " + strings.TrimSpace(body.Purpose))
-	if note == "" {
-		note = "外部 API 已领取"
-	} else {
-		note = "外部 API 已领取：" + note
-	}
-	mailbox, err := s.store.ClaimAvailableMailbox(note)
+	mailbox, lease, created, err := s.store.ClaimMailboxLease(
+		body.Project,
+		body.Purpose,
+		body.RequestID,
+		body.Note,
+		s.mailboxLeaseTTL(body.TTLSeconds),
+		time.Now(),
+	)
 	if err != nil {
-		writeError(w, http.StatusOK, "no_available_mailbox", err.Error())
+		if errors.Is(err, store.ErrNoAvailableMailbox) {
+			writeError(w, http.StatusOK, "no_available_mailbox", err.Error())
+			return
+		}
+		writeMailboxLeaseError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"mailbox": s.publicMailbox(r, mailbox, true)}})
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{
+		"mailbox":    s.publicMailbox(r, mailbox, true),
+		"lease":      s.publicMailboxLease(lease),
+		"created":    created,
+		"idempotent": !created,
+	}})
 }
 
 func (s *Server) handlePublicLookupMailboxes(w http.ResponseWriter, r *http.Request) {
@@ -347,6 +366,7 @@ func (s *Server) handleExportRuntime(w http.ResponseWriter, r *http.Request) {
 		ExportedAt     time.Time              `json:"exported_at"`
 		AppleAccounts  []domain.AppleAccount  `json:"apple_accounts"`
 		Mailboxes      []domain.Mailbox       `json:"mailboxes"`
+		MailboxLeases  []domain.MailboxLease  `json:"mailbox_leases"`
 		ICloudSessions []domain.ICloudSession `json:"icloud_sessions"`
 		CreateSettings domain.CreateSettings  `json:"create_settings"`
 		Settings       domain.Settings        `json:"settings"`
@@ -354,7 +374,7 @@ func (s *Server) handleExportRuntime(w http.ResponseWriter, r *http.Request) {
 		Messages       []domain.Message       `json:"messages,omitempty"`
 	}{
 		SchemaVersion: state.SchemaVersion, ExportedAt: time.Now(), AppleAccounts: state.AppleAccounts,
-		Mailboxes: state.Mailboxes, ICloudSessions: state.ICloudSessions, CreateSettings: state.CreateSettings,
+		Mailboxes: state.Mailboxes, MailboxLeases: state.MailboxLeases, ICloudSessions: state.ICloudSessions, CreateSettings: state.CreateSettings,
 		Settings: state.Settings, MessageCount: len(state.Messages),
 	}
 	if parseBool(r.URL.Query().Get("include_messages")) {
@@ -452,7 +472,7 @@ func (s *Server) publicMailbox(r *http.Request, mailbox domain.Mailbox, includeA
 	out := map[string]any{
 		"id": mailbox.ID, "account_id": mailbox.AccountID, "label": mailbox.Label, "email": mailbox.Email,
 		"api_active": mailbox.APIActive, "icloud_active": mailbox.ICloudActive, "status": mailbox.Status,
-		"note": mailbox.Note, "receive_count": mailbox.ReceiveCount, "last_sync_at": mailbox.LastSyncAt,
+		"note": mailbox.Note, "active_lease_id": mailbox.ActiveLeaseID, "receive_count": mailbox.ReceiveCount, "last_sync_at": mailbox.LastSyncAt,
 	}
 	if includeAPI {
 		out["api_url"] = s.mailboxAPIURL(r, mailbox)

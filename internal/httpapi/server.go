@@ -87,6 +87,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/mailboxes/claim", s.handlePublicClaimMailbox)
 	s.mux.HandleFunc("POST /api/v1/mailboxes/lookup", s.handlePublicLookupMailboxes)
 	s.mux.HandleFunc("GET /api/v1/mailboxes/{email}/code", s.handlePublicMailboxCode)
+	s.mux.HandleFunc("POST /api/v1/mailboxes/{email}/commit", s.handlePublicMailboxLeaseCommitCompat)
+	s.mux.HandleFunc("POST /api/v1/mailboxes/{email}/release", s.handlePublicMailboxLeaseReleaseCompat)
+	s.mux.HandleFunc("POST /api/v1/mailboxes/{email}/renew", s.handlePublicMailboxLeaseRenewCompat)
+	s.mux.HandleFunc("GET /api/v1/mailbox-leases/{lease_id}", s.handlePublicMailboxLease)
+	s.mux.HandleFunc("POST /api/v1/mailbox-leases/{lease_id}/commit", s.handlePublicMailboxLeaseCommit)
+	s.mux.HandleFunc("POST /api/v1/mailbox-leases/{lease_id}/release", s.handlePublicMailboxLeaseRelease)
+	s.mux.HandleFunc("POST /api/v1/mailbox-leases/{lease_id}/renew", s.handlePublicMailboxLeaseRenew)
+	s.mux.HandleFunc("POST /api/v1/mailbox-leases/{lease_id}/note", s.handlePublicMailboxLeaseNote)
 	s.mux.HandleFunc("GET /api/v1/public-code/status", s.handlePublicCodePageStatus)
 	s.mux.HandleFunc("GET /api/v1/public-code", s.handlePublicCodePageLookup)
 	s.mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
@@ -140,11 +148,40 @@ func (s *Server) StartBackground(ctx context.Context) {
 		ctx = context.Background()
 	}
 	s.runtimeCtx = ctx
+	go s.runMailboxLeaseReaper(ctx)
 	if s.cfg.AppleAccountKeepAliveEnabled {
 		go s.runAppleKeepAlive(ctx)
 	}
 	if s.cfg.MailWatcherEnabled {
 		go s.watcher.Run(ctx)
+	}
+}
+
+func (s *Server) runMailboxLeaseReaper(ctx context.Context) {
+	interval := time.Duration(s.cfg.PublicMailboxLeaseSweepSeconds) * time.Second
+	if interval < 5*time.Second {
+		interval = 30 * time.Second
+	}
+	reap := func() {
+		count, err := s.store.ExpireMailboxLeases(time.Now())
+		if err != nil {
+			s.log.Warn("回收过期邮箱租约失败", "错误", err)
+			return
+		}
+		if count > 0 {
+			s.log.Info("已回收过期邮箱租约", "数量", count)
+		}
+	}
+	reap()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reap()
+		}
 	}
 }
 
@@ -554,6 +591,7 @@ func (s *Server) handleAppleAccountSaveIMAP(w http.ResponseWriter, r *http.Reque
 		writeServiceError(w, err)
 		return
 	}
+	s.watcher.Wake("")
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"account": account}})
 }
 
@@ -739,9 +777,29 @@ func (s *Server) handleMailboxCode(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTasks(w http.ResponseWriter, _ *http.Request) {
 	settings := s.store.Settings()
 	schedulerState := s.scheduler.Snapshot()
+	watcherSnapshot := s.watcher.Snapshot()
 	watcherStatus := "idle"
-	if s.cfg.MailWatcherEnabled && settings.EnableMailWatcher {
-		watcherStatus = "running"
+	watcherDescription := "后台监听尚未开启"
+	if !s.cfg.MailWatcherEnabled {
+		watcherDescription = "config.json 已关闭后台邮件监听能力"
+	} else if settings.EnableMailWatcher {
+		switch {
+		case !watcherSnapshot.Running:
+			watcherStatus = "starting"
+			watcherDescription = "后台监听正在启动"
+		case watcherSnapshot.GroupCount == 0:
+			watcherStatus = "waiting"
+			watcherDescription = "已开启，但没有找到同时具备 IMAP 登录态和可用邮箱的账号"
+		case watcherSnapshot.LastError != "":
+			watcherStatus = "failed"
+			watcherDescription = "IMAP 同步异常：" + watcherSnapshot.LastError
+		case watcherSnapshot.ConnectedWorkerCount == 0 && watcherSnapshot.LastIdleError != "":
+			watcherStatus = "failed"
+			watcherDescription = "IMAP IDLE 连接异常：" + watcherSnapshot.LastIdleError
+		default:
+			watcherStatus = "running"
+			watcherDescription = fmt.Sprintf("正在监听 %d 个账号分组，IDLE 已连接 %d/%d，已同步 %d 封邮件", watcherSnapshot.GroupCount, watcherSnapshot.ConnectedWorkerCount, watcherSnapshot.WorkerCount, watcherSnapshot.SyncedMessages)
+		}
 	}
 	keepAliveStatus := "idle"
 	if s.cfg.AppleAccountKeepAliveEnabled && settings.EnableAppleKeepAlive {
@@ -757,7 +815,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, _ *http.Request) {
 		{ID: "data-store", Name: "本地数据存储", Description: "保存账号、邮箱、设置和 Apple 登录态", Status: "completed", Progress: 100, Module: "data"},
 		{ID: "apple-account", Name: "Apple 账号管理", Description: "Apple Account、iCloud Web、2FA 和登录态检测", Status: "completed", Progress: 100, Module: "apple"},
 		{ID: "mailbox-create", Name: "隐私邮箱闭环", Description: "创建、同步、收信、取码、停用和 Apple 远程删除", Status: "completed", Progress: 100, Module: "mailbox"},
-		{ID: "imap-watcher", Name: "后台邮件监听", Description: "按账号批量同步并使用 IMAP IDLE 实时监听新邮件", Status: watcherStatus, Progress: 100, Module: "imap"},
+		{ID: "imap-watcher", Name: "后台邮件监听", Description: watcherDescription, Status: watcherStatus, Progress: 100, Module: "imap"},
 		{ID: "apple-keepalive", Name: "Apple 登录态保活", Description: "周期刷新 Apple Account 管理态", Status: keepAliveStatus, Progress: 100, Module: "apple", NextRunAt: keepAliveNextAtPointer, ScheduledIntervalSeconds: int(keepAliveInterval.Seconds()), JitterPercent: s.cfg.AppleAccountKeepAliveJitterPercent},
 		{ID: "scheduler", Name: "定时创建", Description: "按所选账号周期创建隐私邮箱", Status: schedulerState.Status, Progress: 100, Module: "scheduler"},
 		{ID: "public-api", Name: "公共取号 API", Description: "健康检查、取号、查询、邮箱取码和 API Key", Status: enabledTaskStatus(settings.EnablePublicMailboxAPI), Progress: 100, Module: "api"},
@@ -791,6 +849,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
 			"mail_watcher_fetch_limit":         s.cfg.MailWatcherFetchLimit,
 			"mail_watcher_initial_fetch_limit": s.cfg.MailWatcherInitialFetchLimit,
 			"mail_watcher_lookback_hours":      s.cfg.MailWatcherLookbackHours,
+			"mail_watcher_status":              s.watcher.Snapshot(),
 			"apple_keep_alive_available":       s.cfg.AppleAccountKeepAliveEnabled,
 			"apple_keep_alive_ms":              s.cfg.AppleAccountKeepAliveMS,
 			"apple_keep_alive_jitter_percent":  s.cfg.AppleAccountKeepAliveJitterPercent,
@@ -813,6 +872,7 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "settings_save_failed", err.Error())
 		return
 	}
+	s.watcher.Wake("")
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"settings": saved}})
 }
 
@@ -930,7 +990,7 @@ func writeServiceError(w http.ResponseWriter, err error) {
 
 func validMailboxStatus(status string) bool {
 	switch strings.TrimSpace(status) {
-	case domain.StatusActive, domain.StatusAvailable, domain.StatusUsed, domain.StatusFailed, domain.StatusDisabled:
+	case domain.StatusActive, domain.StatusAvailable, domain.StatusReserved, domain.StatusUsed, domain.StatusFailed, domain.StatusDisabled:
 		return true
 	default:
 		return false

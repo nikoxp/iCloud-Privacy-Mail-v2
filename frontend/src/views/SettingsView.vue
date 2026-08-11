@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CalendarClock, CheckCircle2, CircleAlert, Database, ExternalLink, Eye, EyeOff, FolderGit2, GitCommit, Globe2, KeyRound, LoaderCircle, Monitor, PackageOpen, RefreshCw, Save, ShieldCheck, Sparkles } from '@lucide/vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api/client'
@@ -12,6 +12,7 @@ const saving = ref('')
 const dataPath = ref('')
 const runtime = ref({})
 const showPublicAPIKey = ref(false)
+let runtimeRefreshTimer
 const form = reactive({
   mailbox_page_size: 7,
   enable_mail_watcher: false,
@@ -28,6 +29,22 @@ const publicAPIKeySourceText = computed(() => {
   if (String(form.public_api_key || '').trim()) return '系统设置'
   if (runtime.value.config_api_key_configured) return 'config.json'
   return '尚未设置'
+})
+const mailWatcherStatusText = computed(() => {
+  const status = runtime.value.mail_watcher_status || {}
+  if (!runtime.value.mail_watcher_available) return '配置文件已关闭监听能力'
+  if (!form.enable_mail_watcher) return '当前未开启'
+  if (!status.running) return '后台监听正在启动'
+  if (!status.group_count) return '等待可用的 IMAP 登录态和邮箱'
+  if (status.last_error) return `运行异常：${status.last_error}`
+  if (!status.connected_worker_count && status.last_idle_error) return `IDLE 连接异常：${status.last_idle_error}`
+  return `正在监听 ${status.group_count} 个账号分组，IDLE 已连接 ${status.connected_worker_count || 0}/${status.worker_count || 0}，已同步 ${status.synced_messages || 0} 封邮件`
+})
+const mailWatcherStatusClass = computed(() => {
+  const status = runtime.value.mail_watcher_status || {}
+  if (status.last_error || (!status.connected_worker_count && status.last_idle_error)) return 'text-rose-500'
+  if (form.enable_mail_watcher && status.running && status.group_count) return 'text-emerald-600 dark:text-emerald-300'
+  return 'text-amber-500'
 })
 
 function notify(text, isError = false) {
@@ -70,6 +87,15 @@ async function saveSystem() {
   } catch (err) { notify(err.message, true) } finally { saving.value = '' }
 }
 
+async function refreshRuntime() {
+  try {
+    const settingsData = await api('/api/settings')
+    runtime.value = settingsData.runtime || runtime.value
+  } catch {
+    return
+  }
+}
+
 function formatDate(value) {
   if (!value) return '-'
   const date = new Date(value)
@@ -109,7 +135,10 @@ watch(() => route.hash, scrollToVersionCard)
 onMounted(async () => {
   await Promise.allSettled([load(), loadUpdates()])
   scrollToVersionCard()
+  runtimeRefreshTimer = window.setInterval(refreshRuntime, 5000)
 })
+
+onBeforeUnmount(() => window.clearInterval(runtimeRefreshTimer))
 </script>
 
 <template>
@@ -118,7 +147,7 @@ onMounted(async () => {
     <template v-else>
       <form class="panel space-y-7 p-5 sm:p-7" @submit.prevent="saveSystem">
         <section><h3 class="section-title flex items-center gap-2"><Database :size="16" />本地数据</h3><div class="grid gap-4 sm:grid-cols-2"><label class="form-group"><span class="form-label">邮箱池每页数量</span><input v-model.number="form.mailbox_page_size" class="field" type="number" min="5" max="200" /><span class="form-help">控制邮箱池列表单页显示数量。</span></label><label class="form-group"><span class="form-label">状态文件</span><input :value="dataPath" class="field font-mono text-xs" readonly /><span class="form-help">账号登录态和 App 专用密码也保存在此本地文件。</span></label></div></section>
-        <section><h3 class="section-title flex items-center gap-2"><ShieldCheck :size="16" />后台能力</h3><div class="grid gap-4 sm:grid-cols-2"><label class="toggle-card"><span><strong>IMAP 实时邮件监听</strong><small>使用 IDLE 接收事件，每 {{ runtime.mail_watcher_poll_ms || 3000 }} 毫秒重检分组；首次最多拉取 {{ runtime.mail_watcher_initial_fetch_limit || 20 }} 封</small></span><input v-model="form.enable_mail_watcher" class="detail-switch" type="checkbox" :disabled="!runtime.mail_watcher_available" /></label><label class="toggle-card"><span><strong>Apple 登录态保活</strong><small>基础 {{ Math.round((runtime.apple_keep_alive_ms || 180000) / 60000) }} 分钟；每 30 秒扫描并在每轮重新随机 ±{{ runtime.apple_keep_alive_jitter_percent ?? 15 }}%</small></span><input v-model="form.enable_apple_keep_alive" class="detail-switch" type="checkbox" :disabled="!runtime.apple_keep_alive_available" /></label></div></section>
+        <section><h3 class="section-title flex items-center gap-2"><ShieldCheck :size="16" />后台能力</h3><div class="grid gap-4 sm:grid-cols-2"><label class="toggle-card"><span><strong>IMAP 实时邮件监听</strong><small>使用 IDLE 接收事件，每 {{ runtime.mail_watcher_poll_ms || 3000 }} 毫秒重检分组；首次最多拉取 {{ runtime.mail_watcher_initial_fetch_limit || 20 }} 封</small><small :class="mailWatcherStatusClass" class="mt-1 font-semibold">当前状态：{{ mailWatcherStatusText }}</small></span><input v-model="form.enable_mail_watcher" class="detail-switch" type="checkbox" :disabled="!runtime.mail_watcher_available" /></label><label class="toggle-card"><span><strong>Apple 登录态保活</strong><small>基础 {{ Math.round((runtime.apple_keep_alive_ms || 180000) / 60000) }} 分钟；每 30 秒扫描并在每轮重新随机 ±{{ runtime.apple_keep_alive_jitter_percent ?? 15 }}%</small></span><input v-model="form.enable_apple_keep_alive" class="detail-switch" type="checkbox" :disabled="!runtime.apple_keep_alive_available" /></label></div></section>
         <section>
           <h3 class="section-title flex items-center gap-2"><Globe2 :size="16" />公共访问</h3>
           <div class="grid gap-4 sm:grid-cols-2">

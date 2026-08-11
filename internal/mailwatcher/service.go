@@ -23,13 +23,36 @@ const (
 )
 
 type Service struct {
-	cfg         config.Config
-	store       *store.Store
-	mailbox     *mailboxservice.Service
-	log         *slog.Logger
-	wake        chan struct{}
-	activeMu    sync.Mutex
-	activeUntil map[string]time.Time
+	cfg          config.Config
+	store        *store.Store
+	mailbox      *mailboxservice.Service
+	log          *slog.Logger
+	wake         chan struct{}
+	activeMu     sync.Mutex
+	activeUntil  map[string]time.Time
+	statusMu     sync.RWMutex
+	status       Status
+	readyWorkers map[string]bool
+}
+
+// Status 是后台监听的真实运行快照，避免仅根据配置开关误报“运行中”。
+type Status struct {
+	Running              bool      `json:"running"`
+	Enabled              bool      `json:"enabled"`
+	GroupCount           int       `json:"group_count"`
+	WorkerCount          int       `json:"worker_count"`
+	ConnectedWorkerCount int       `json:"connected_worker_count"`
+	SyncedMessages       int       `json:"synced_messages"`
+	IdleEvents           int       `json:"idle_events"`
+	StartedAt            time.Time `json:"started_at,omitempty"`
+	LastCycleAt          time.Time `json:"last_cycle_at,omitempty"`
+	LastSuccessAt        time.Time `json:"last_success_at,omitempty"`
+	LastIdleConnectedAt  time.Time `json:"last_idle_connected_at,omitempty"`
+	LastIdleEventAt      time.Time `json:"last_idle_event_at,omitempty"`
+	LastErrorAt          time.Time `json:"last_error_at,omitempty"`
+	LastError            string    `json:"last_error,omitempty"`
+	LastIdleErrorAt      time.Time `json:"last_idle_error_at,omitempty"`
+	LastIdleError        string    `json:"last_idle_error,omitempty"`
 }
 
 type watchGroup struct {
@@ -50,12 +73,13 @@ func NewService(cfg config.Config, state *store.Store, mailbox *mailboxservice.S
 		logger = slog.Default()
 	}
 	return &Service{
-		cfg:         cfg,
-		store:       state,
-		mailbox:     mailbox,
-		log:         logger,
-		wake:        make(chan struct{}, 1),
-		activeUntil: make(map[string]time.Time),
+		cfg:          cfg,
+		store:        state,
+		mailbox:      mailbox,
+		log:          logger,
+		wake:         make(chan struct{}, 1),
+		activeUntil:  make(map[string]time.Time),
+		readyWorkers: make(map[string]bool),
 	}
 }
 
@@ -68,25 +92,44 @@ func (s *Service) Run(ctx context.Context) {
 	defer ticker.Stop()
 	workers := make(map[string]idleWorker)
 	defer stopIdleWorkers(workers)
+	defer s.resetReadyWorkers()
 	s.log.Info("后台邮件监听已启动", "轮询间隔", interval)
+	s.updateStatus(func(status *Status) {
+		status.Running = true
+		status.StartedAt = time.Now()
+	})
+	defer s.updateStatus(func(status *Status) {
+		status.Running = false
+		status.WorkerCount = 0
+		status.ConnectedWorkerCount = 0
+	})
 
 	started := false
 	cycle := func() {
 		enabled := s.cfg.MailWatcherEnabled && s.store.Settings().EnableMailWatcher
+		groups := s.groups()
+		s.updateStatus(func(status *Status) {
+			status.Enabled = enabled
+			status.GroupCount = len(groups)
+			status.LastCycleAt = time.Now()
+		})
 		if !enabled {
 			if started {
 				stopIdleWorkers(workers)
 				started = false
 			}
+			s.resetReadyWorkers()
+			s.updateStatus(func(status *Status) { status.WorkerCount = 0 })
 			return
 		}
+		initial := !started
+		synced, syncErr := s.syncRound(ctx, groups, initial)
+		s.recordSyncResult(synced, syncErr)
 		if !started {
-			s.syncRound(ctx, true)
 			started = true
-		} else {
-			s.syncRound(ctx, false)
 		}
-		s.ensureIdleWorkers(ctx, workers)
+		s.ensureIdleWorkers(ctx, workers, groups)
+		s.updateStatus(func(status *Status) { status.WorkerCount = len(workers) })
 	}
 	cycle()
 	for {
@@ -116,10 +159,9 @@ func (s *Service) Wake(mailboxID string) {
 	}
 }
 
-func (s *Service) syncRound(ctx context.Context, initial bool) {
-	groups := s.groups()
+func (s *Service) syncRound(ctx context.Context, groups []watchGroup, initial bool) (int, error) {
 	if len(groups) == 0 {
-		return
+		return 0, nil
 	}
 	after := time.Time{}
 	limit := s.cfg.MailWatcherFetchLimit
@@ -129,21 +171,25 @@ func (s *Service) syncRound(ctx context.Context, initial bool) {
 			after = time.Now().Add(-time.Duration(s.cfg.MailWatcherLookbackHours) * time.Hour)
 		}
 	}
+	total := 0
+	var lastErr error
 	for _, group := range groups {
 		if ctx.Err() != nil {
-			return
+			return total, ctx.Err()
 		}
 		syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
-		_, err := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, after, "OpenAI", limit)
+		count, err := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, after, "OpenAI", limit)
 		cancel()
+		total += count
 		if err != nil && ctx.Err() == nil {
+			lastErr = err
 			s.log.Warn("后台批量同步邮箱失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "首次同步", initial, "错误", err)
 		}
 	}
+	return total, lastErr
 }
 
-func (s *Service) ensureIdleWorkers(ctx context.Context, workers map[string]idleWorker) {
-	groups := s.groups()
+func (s *Service) ensureIdleWorkers(ctx context.Context, workers map[string]idleWorker, groups []watchGroup) {
 	seen := make(map[string]bool, len(groups))
 	for _, group := range groups {
 		seen[group.key] = true
@@ -152,11 +198,8 @@ func (s *Service) ensureIdleWorkers(ctx context.Context, workers map[string]idle
 		}
 		if worker, ok := workers[group.key]; ok {
 			worker.cancel()
+			s.markWorkerReady(group.key, false)
 			delete(workers, group.key)
-		}
-		if err := s.ensureBaseline(ctx, group); err != nil {
-			s.log.Warn("初始化 IMAP UID 起点失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "错误", err)
-			continue
 		}
 		workerCtx, cancel := context.WithCancel(ctx)
 		workers[group.key] = idleWorker{cancel: cancel, signature: group.signature}
@@ -167,45 +210,47 @@ func (s *Service) ensureIdleWorkers(ctx context.Context, workers map[string]idle
 			continue
 		}
 		worker.cancel()
+		s.markWorkerReady(key, false)
 		delete(workers, key)
 	}
-}
-
-func (s *Service) ensureBaseline(ctx context.Context, group watchGroup) error {
-	if strings.TrimSpace(group.state.IMAPLastSyncUID) != "" {
-		return nil
-	}
-	uid, err := protocol.LatestICloudIMAPUID(ctx, group.state)
-	if err != nil || strings.TrimSpace(uid) == "" {
-		return err
-	}
-	group.state.IMAPLastSyncUID = strings.TrimSpace(uid)
-	group.state.IMAPLastSyncAt = time.Now()
-	group.session = protocol.WithLoginState(group.session, group.state)
-	_, err = s.store.SaveICloudSession(group.session)
-	return err
 }
 
 func (s *Service) runIdleWorker(ctx context.Context, group watchGroup) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		err := protocol.WatchICloudIMAPExists(ctx, group.state, func() {
+			s.markWorkerReady(group.key, true)
+			s.updateStatus(func(status *Status) {
+				status.LastIdleConnectedAt = time.Now()
+				status.LastIdleError = ""
+			})
+		}, func() {
 			if ctx.Err() != nil {
 				return
 			}
+			s.updateStatus(func(status *Status) {
+				status.IdleEvents++
+				status.LastIdleEventAt = time.Now()
+			})
 			syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
-			_, syncErr := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, time.Time{}, "OpenAI", s.cfg.MailWatcherFetchLimit)
+			count, syncErr := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, time.Time{}, "OpenAI", s.cfg.MailWatcherFetchLimit)
 			cancel()
+			s.recordSyncResult(count, syncErr)
 			if syncErr != nil && ctx.Err() == nil {
 				s.log.Warn("IMAP IDLE 触发同步失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "错误", syncErr)
 			}
 		})
+		s.markWorkerReady(group.key, false)
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil {
-			s.log.Warn("IMAP IDLE 已断开，准备重连", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "等待", backoff, "错误", err)
+		if err == nil {
+			// 收到 EXISTS 后连接会退出当前 IDLE，立即重新建立监听，不进入故障退避。
+			backoff = time.Second
+			continue
 		}
+		s.recordWatcherError(err)
+		s.log.Warn("IMAP IDLE 已断开，准备重连", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "等待", backoff, "错误", err)
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
@@ -217,6 +262,63 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup) {
 			backoff *= 2
 		}
 	}
+}
+
+// Snapshot 返回并发安全的后台监听运行快照。
+func (s *Service) Snapshot() Status {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+	return s.status
+}
+
+func (s *Service) updateStatus(update func(*Status)) {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	update(&s.status)
+}
+
+func (s *Service) recordSyncResult(count int, err error) {
+	now := time.Now()
+	s.updateStatus(func(status *Status) {
+		if count > 0 {
+			status.SyncedMessages += count
+		}
+		if err != nil {
+			status.LastError = err.Error()
+			status.LastErrorAt = now
+			return
+		}
+		status.LastSuccessAt = now
+		status.LastError = ""
+	})
+}
+
+func (s *Service) recordWatcherError(err error) {
+	if err == nil {
+		return
+	}
+	s.updateStatus(func(status *Status) {
+		status.LastIdleError = err.Error()
+		status.LastIdleErrorAt = time.Now()
+	})
+}
+
+func (s *Service) markWorkerReady(key string, ready bool) {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	if ready {
+		s.readyWorkers[key] = true
+	} else {
+		delete(s.readyWorkers, key)
+	}
+	s.status.ConnectedWorkerCount = len(s.readyWorkers)
+}
+
+func (s *Service) resetReadyWorkers() {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	s.readyWorkers = make(map[string]bool)
+	s.status.ConnectedWorkerCount = 0
 }
 
 func (s *Service) groups() []watchGroup {

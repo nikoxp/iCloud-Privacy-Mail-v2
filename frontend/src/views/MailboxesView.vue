@@ -42,8 +42,10 @@ const syncAccountID = ref('')
 let searchTimer
 let loadingTimer
 let codeBusyTimer
+let autoRefreshTimer
 let loadRequestID = 0
 let deleteQueueRunning = false
+let autoRefreshing = false
 let deleteNoticeID = null
 let deleteSucceeded = 0
 let deleteFailed = 0
@@ -53,12 +55,14 @@ const { confirm: confirmAction } = useConfirm()
 const mailboxStatusOptions = [
   { value: '', label: '全部状态', dot: 'bg-slate-400' },
   { value: 'available', label: '可用', dot: 'bg-emerald-500' },
+  { value: 'reserved', label: '已预留', dot: 'bg-violet-500' },
   { value: 'used', label: '已使用', dot: 'bg-amber-500' },
   { value: 'failed', label: '失败', dot: 'bg-rose-500' },
   { value: 'disabled', label: '已停用', dot: 'bg-slate-500' },
 ]
 const mailboxDetailStatusOptions = [
   { value: 'available', label: '可用', dot: 'bg-emerald-500' },
+  { value: 'reserved', label: '已预留（由租约管理）', dot: 'bg-violet-500', disabled: true },
   { value: 'used', label: '已使用', dot: 'bg-amber-500' },
   { value: 'active', label: '活跃', dot: 'bg-sky-500' },
   { value: 'failed', label: '失败', dot: 'bg-rose-500' },
@@ -86,11 +90,12 @@ const rangeText = computed(() => {
 })
 
 function statusLabel(value) {
-  return ({ available: '可用', used: '已使用', failed: '失败', disabled: '已停用', active: '活跃' })[value] || value || '未知'
+  return ({ available: '可用', reserved: '已预留', used: '已使用', failed: '失败', disabled: '已停用', active: '活跃' })[value] || value || '未知'
 }
 
 function statusClass(value) {
   if (value === 'available' || value === 'active') return 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-300'
+  if (value === 'reserved') return 'bg-violet-50 text-violet-600 dark:bg-violet-950/40 dark:text-violet-300'
   if (value === 'failed') return 'bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300'
   if (value === 'disabled') return 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-300'
   return 'bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300'
@@ -143,12 +148,15 @@ function finishCodeBusy(key) {
 }
 
 function formatTime(value) {
-  return value ? new Date(value).toLocaleString('zh-CN') : '-'
+  if (!value) return '-'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) || date.getFullYear() < 2000 ? '-' : date.toLocaleString('zh-CN')
 }
 
 function formatMessageTime(value) {
   if (!value) return '-'
   const date = new Date(value)
+  if (Number.isNaN(date.getTime()) || date.getFullYear() < 2000) return '-'
   const today = new Date()
   const sameDay = date.getFullYear() === today.getFullYear() && date.getMonth() === today.getMonth() && date.getDate() === today.getDate()
   return sameDay
@@ -175,14 +183,17 @@ function openSyncDialog() {
   showSync.value = true
 }
 
-async function load() {
+async function load(options = {}) {
+  const silent = Boolean(options.silent)
   const requestID = ++loadRequestID
-  loading.value = true
-  loadingVisible.value = false
-  clearTimeout(loadingTimer)
-  loadingTimer = setTimeout(() => {
-    if (loading.value && requestID === loadRequestID) loadingVisible.value = true
-  }, 600)
+  if (!silent) {
+    loading.value = true
+    loadingVisible.value = false
+    clearTimeout(loadingTimer)
+    loadingTimer = setTimeout(() => {
+      if (loading.value && requestID === loadRequestID) loadingVisible.value = true
+    }, 600)
+  }
   try {
     const params = new URLSearchParams({ page: String(page.value) })
     if (query.value.trim()) params.set('q', query.value.trim())
@@ -193,13 +204,39 @@ async function load() {
     result.value = data
     page.value = result.value.page
   } catch (err) {
-    if (requestID === loadRequestID) flash(err.message, true)
+    if (!silent && requestID === loadRequestID) flash(err.message, true)
   } finally {
-    if (requestID === loadRequestID) {
+    if (!silent && requestID === loadRequestID) {
       clearTimeout(loadingTimer)
       loading.value = false
       loadingVisible.value = false
     }
+  }
+}
+
+async function refreshMailboxPool() {
+  if (document.hidden || loading.value || autoRefreshing || deleteQueueRunning || busy.value) return
+  autoRefreshing = true
+  try {
+    await load({ silent: true })
+    const selectedID = selected.value?.id
+    if (!selectedID || quickEditOpen.value) return
+    const [detail, messageData] = await Promise.all([
+      api(`/api/mailboxes/${selectedID}`),
+      api(`/api/mailboxes/${selectedID}/messages`),
+    ])
+    if (selected.value?.id !== selectedID) return
+    const previous = selected.value
+    if (edit.status === previous.status) edit.status = detail.mailbox.status
+    if (edit.api_active === previous.api_active) edit.api_active = detail.mailbox.api_active
+    if (edit.icloud_active === previous.icloud_active) edit.icloud_active = detail.mailbox.icloud_active
+    if (edit.note === (previous.note || '')) edit.note = detail.mailbox.note || ''
+    selected.value = detail.mailbox
+    messages.value = messageData.items || []
+  } catch {
+    return
+  } finally {
+    autoRefreshing = false
   }
 }
 
@@ -498,7 +535,7 @@ function updateDeleteProgress() {
   const current = deleteQueue.value[0]
   if (!current) return
   const waiting = Math.max(0, deleteQueue.value.length - (deletingMailboxID.value ? 1 : 0))
-  const action = deletingMailboxID.value ? `正在彻底删除：${current.email}` : `等待彻底删除：${current.email}`
+  const action = deletingMailboxID.value ? `正在清理邮件并彻底删除：${current.email}` : `等待彻底删除：${current.email}`
   const queueText = waiting ? `；另有 ${waiting} 个排队中` : ''
   const finished = deleteSucceeded + deleteFailed
   const finishedText = finished ? `；已处理 ${finished} 个（成功 ${deleteSucceeded}，失败 ${deleteFailed}）` : ''
@@ -553,8 +590,8 @@ async function deleteMailbox(mailbox, localOnly) {
   }
   deleteConfirmID.value = mailbox.id
   const text = localOnly
-    ? '只删除本地记录和本地邮件，Apple 服务器上的隐私邮箱会保留。继续吗？'
-    : `将从 Apple 服务器彻底删除 ${mailbox.email}，确认远端不存在后再删除本地记录和邮件。此操作不可恢复，继续吗？`
+    ? '将先清空本地邮件，再删除本地邮箱记录；Apple 服务器上的隐私邮箱会保留。继续吗？'
+    : `将先清空 ${mailbox.email} 的 Apple 远端邮件和本地邮件，再从 Apple 服务器彻底删除邮箱并确认远端不存在。此操作不可恢复，继续吗？`
   try {
     const confirmed = await confirmAction({
       title: localOnly ? '只删除本地记录' : '彻底删除隐私邮箱',
@@ -565,11 +602,11 @@ async function deleteMailbox(mailbox, localOnly) {
     if (!confirmed) return
     const busyKey = localOnly ? 'delete-local' : 'delete-remote'
     busy.value = busyKey
-    deleteNoticeID = updateToast(deleteNoticeID, localOnly ? `正在删除本地记录：${mailbox.email}` : `正在彻底删除：${mailbox.email}`, 'info', 0)
+    deleteNoticeID = updateToast(deleteNoticeID, localOnly ? `正在清理本地邮件并删除记录：${mailbox.email}` : `正在清理邮件并彻底删除：${mailbox.email}`, 'info', 0)
     try {
       const suffix = localOnly ? '?local_only=1' : ''
       await api(`/api/mailboxes/${mailbox.id}${suffix}`, { method: 'DELETE' })
-      deleteNoticeID = updateToast(deleteNoticeID, localOnly ? '本地邮箱记录已删除' : 'Apple 服务器和本地邮箱记录均已删除', 'success', 7000)
+      deleteNoticeID = updateToast(deleteNoticeID, localOnly ? '本地邮件和邮箱记录均已删除' : 'Apple 远端邮件、本地邮件和邮箱记录均已删除', 'success', 7000)
       if (selected.value?.id === mailbox.id) {
         selected.value = null
         messages.value = []
@@ -603,7 +640,7 @@ async function removeMailboxFromRow(mailbox) {
   try {
     const confirmed = await confirmAction({
       title: '彻底删除隐私邮箱',
-      message: `将从 Apple 服务器彻底删除 ${mailbox.email}，确认远端不存在后再删除本地记录和邮件。此操作不可恢复，继续吗？`,
+      message: `将先清空 ${mailbox.email} 的 Apple 远端邮件和本地邮件，再从 Apple 服务器彻底删除邮箱并确认远端不存在。此操作不可恢复，继续吗？`,
       confirmText: '确认彻底删除',
       tone: 'danger',
     })
@@ -650,11 +687,13 @@ watch(selected, (value) => {
 onMounted(() => {
   document.addEventListener('keydown', handlePageKeydown)
   Promise.all([load(), loadAccounts()])
+  autoRefreshTimer = window.setInterval(refreshMailboxPool, 4000)
 })
 onBeforeUnmount(() => {
   clearTimeout(searchTimer)
   clearTimeout(loadingTimer)
   clearTimeout(codeBusyTimer)
+  window.clearInterval(autoRefreshTimer)
   document.body.style.overflow = ''
   document.removeEventListener('keydown', handlePageKeydown)
 })
@@ -730,7 +769,7 @@ onBeforeUnmount(() => {
                     <button class="mailbox-action-button mailbox-action-sync" :class="{ 'mailbox-action-sync-selected': busy === `sync-row:${mailbox.id}` }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" title="同步该邮箱的最新邮件" @click.stop="quickSyncMailbox(mailbox)"><LoaderCircle v-if="busy === `sync-row:${mailbox.id}`" :size="13" class="animate-spin" /><RefreshCw v-else :size="13" />同步</button>
                     <button class="mailbox-action-button mailbox-action-code" :class="{ 'mailbox-action-code-selected': busy === `code-row:${mailbox.id}` || (codeDialogOpen && codeMailbox?.id === mailbox.id) }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" title="获取该邮箱的最新验证码" @click.stop="quickGetCode(mailbox)"><LoaderCircle v-if="codeBusyVisible === `code-row:${mailbox.id}`" :size="13" class="animate-spin" /><KeyRound v-else :size="13" />取码</button>
                     <button class="mailbox-action-button mailbox-action-detail" :class="{ 'mailbox-action-detail-selected': selected?.id === mailbox.id }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" title="查看邮箱详情" @click.stop="openMailbox(mailbox)"><LoaderCircle v-if="busy === `detail:${mailbox.id}`" :size="13" class="animate-spin" /><MailOpen v-else :size="13" />详情</button>
-                    <button class="mailbox-action-button mailbox-action-delete" :class="{ 'mailbox-action-delete-selected': isMailboxDeleteBusy(mailbox.id) }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" :title="deletingMailboxID === mailbox.id ? '正在从 Apple 服务器和本地彻底删除' : isMailboxDeleteQueued(mailbox.id) ? '已加入彻底删除队列' : '从 Apple 服务器和本地彻底删除该邮箱'" @click.stop="removeMailboxFromRow(mailbox)"><LoaderCircle v-if="deletingMailboxID === mailbox.id" :size="13" class="animate-spin" /><LoaderCircle v-else-if="isMailboxDeleteQueued(mailbox.id)" :size="13" class="animate-spin" /><Trash2 v-else :size="13" />{{ deletingMailboxID === mailbox.id ? '删除中' : isMailboxDeleteQueued(mailbox.id) ? '排队中' : '删除' }}</button>
+                    <button class="mailbox-action-button mailbox-action-delete" :class="{ 'mailbox-action-delete-selected': isMailboxDeleteBusy(mailbox.id) }" :disabled="Boolean(busy) || isMailboxDeleteBusy(mailbox.id)" :title="deletingMailboxID === mailbox.id ? '正在清理邮件并彻底删除邮箱' : isMailboxDeleteQueued(mailbox.id) ? '已加入彻底删除队列' : '先清空 Apple 远端及本地邮件，再彻底删除邮箱'" @click.stop="removeMailboxFromRow(mailbox)"><LoaderCircle v-if="deletingMailboxID === mailbox.id" :size="13" class="animate-spin" /><LoaderCircle v-else-if="isMailboxDeleteQueued(mailbox.id)" :size="13" class="animate-spin" /><Trash2 v-else :size="13" />{{ deletingMailboxID === mailbox.id ? '删除中' : isMailboxDeleteQueued(mailbox.id) ? '排队中' : '删除' }}</button>
                   </div>
                 </td>
               </tr>
@@ -758,6 +797,7 @@ onBeforeUnmount(() => {
               </div>
               <h2 id="mailbox-detail-title" class="truncate text-base font-black">{{ selected.email }}</h2>
               <p class="mt-0.5 truncate font-mono text-[10px] text-slate-400">{{ selected.id }}</p>
+              <p v-if="selected.active_lease_id" class="mt-0.5 truncate font-mono text-[10px] text-violet-500">当前租约：{{ selected.active_lease_id }}</p>
             </div>
             <button class="icon-button h-8 w-8 rounded-lg" title="关闭" @click="selected = null"><X :size="17" /></button>
           </div>
@@ -796,7 +836,7 @@ onBeforeUnmount(() => {
           </section>
 
           <section class="rounded-xl border border-rose-200/70 bg-white p-3 dark:border-rose-950 dark:bg-slate-900">
-            <div class="mb-2.5"><h3 class="text-xs font-black text-slate-700 dark:text-slate-200">清理与删除</h3><p class="mt-0.5 text-[10px] leading-4 text-slate-400">远端删除会先操作 Apple 服务器，确认不存在后再删除本地记录。</p></div>
+            <div class="mb-2.5"><h3 class="text-xs font-black text-slate-700 dark:text-slate-200">清理与删除</h3><p class="mt-0.5 text-[10px] leading-4 text-slate-400">彻底删除会先清空 Apple 远端邮件和本地邮件，再删除 Apple 邮箱及本地记录。</p></div>
             <div class="detail-setting-grid"><label class="detail-setting-row"><span><strong>移动已同步邮件</strong><small>移入 Apple 废纸篓</small></span><input v-model="remoteClean.move_synced" class="detail-switch" type="checkbox" /></label><label class="detail-setting-row"><span><strong>清空废纸篓</strong><small>彻底清除废纸篓邮件</small></span><input v-model="remoteClean.empty_trash" class="detail-switch" type="checkbox" /></label></div>
             <div class="mt-2 grid gap-2 sm:grid-cols-2">
               <button class="detail-button detail-button-secondary sm:col-span-2" :disabled="busy === 'clean' || (!remoteClean.move_synced && !remoteClean.empty_trash)" @click="cleanRemote"><LoaderCircle v-if="busy === 'clean'" :size="14" class="animate-spin" /><CloudOff v-else :size="14" />清理 Apple 远端邮件</button>

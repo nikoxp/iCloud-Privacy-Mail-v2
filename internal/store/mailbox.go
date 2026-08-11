@@ -124,19 +124,28 @@ func (s *Store) SetMailboxStatus(id string, apiActive, icloudActive *bool, statu
 		return domain.Mailbox{}, errors.New("邮箱不存在")
 	}
 	mailbox := &s.state.Mailboxes[index]
+	now := time.Now()
 	if apiActive != nil {
 		mailbox.APIActive = *apiActive
 	}
 	if icloudActive != nil {
 		mailbox.ICloudActive = *icloudActive
 	}
-	if strings.TrimSpace(status) != "" {
-		mailbox.Status = strings.TrimSpace(status)
+	desiredStatus := strings.TrimSpace(status)
+	if desiredStatus != "" {
+		if desiredStatus == domain.StatusReserved && mailbox.ActiveLeaseID == "" {
+			return domain.Mailbox{}, errors.New("邮箱没有有效租约，不能手动标记为已预留")
+		}
+		if mailbox.ActiveLeaseID != "" && desiredStatus != domain.StatusReserved {
+			s.completeActiveLeaseFromAdminLocked(mailbox, desiredStatus, now)
+		}
+		mailbox.Status = desiredStatus
 	}
 	if note != nil {
 		mailbox.Note = strings.TrimSpace(*note)
+		s.syncActiveLeaseNoteLocked(*mailbox, mailbox.Note, now)
 	}
-	mailbox.UpdatedAt = time.Now()
+	mailbox.UpdatedAt = now
 	s.appendEventLocked("info", "mailbox", "已更新邮箱状态 "+mailbox.Email)
 	return *mailbox, s.saveLocked()
 }
@@ -149,6 +158,7 @@ func (s *Store) DeleteMailbox(id string) error {
 		return errors.New("邮箱不存在")
 	}
 	email := s.state.Mailboxes[index].Email
+	s.closeMailboxLeasesForDeletionLocked(id, time.Now(), "邮箱已由管理员删除")
 	s.state.Mailboxes = append(s.state.Mailboxes[:index], s.state.Mailboxes[index+1:]...)
 	messages := s.state.Messages[:0]
 	for _, message := range s.state.Messages {
@@ -159,24 +169,6 @@ func (s *Store) DeleteMailbox(id string) error {
 	s.state.Messages = messages
 	s.appendEventLocked("warning", "mailbox", "已删除本地邮箱 "+email)
 	return s.saveLocked()
-}
-
-func (s *Store) ClaimAvailableMailbox(note string) (domain.Mailbox, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.state.Mailboxes {
-		mailbox := &s.state.Mailboxes[i]
-		if !mailbox.APIActive || !mailbox.ICloudActive || mailbox.Status != domain.StatusAvailable {
-			continue
-		}
-		mailbox.Status = domain.StatusUsed
-		if strings.TrimSpace(note) != "" {
-			mailbox.Note = strings.TrimSpace(note)
-		}
-		mailbox.UpdatedAt = time.Now()
-		return *mailbox, s.saveLocked()
-	}
-	return domain.Mailbox{}, errors.New("没有可用隐私邮箱")
 }
 
 func (s *Store) UpsertMessage(mailboxID, remoteID, source, subject, from, body string, receivedAt time.Time) (domain.Message, bool, error) {
@@ -225,6 +217,38 @@ func (s *Store) MessagesForMailbox(mailboxID string) []domain.Message {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ReceivedAt.After(out[j].ReceivedAt) })
 	return out
+}
+
+func (s *Store) DeleteMailboxMessages(mailboxID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mailboxID = strings.TrimSpace(mailboxID)
+	index := s.mailboxIndexLocked(mailboxID)
+	if index < 0 {
+		return 0, errors.New("邮箱不存在")
+	}
+
+	mailbox := &s.state.Mailboxes[index]
+	next := make([]domain.Message, 0, len(s.state.Messages))
+	removed := 0
+	for _, message := range s.state.Messages {
+		if message.MailboxID == mailboxID {
+			removed++
+			continue
+		}
+		next = append(next, message)
+	}
+	metadataChanged := mailbox.ReceiveCount != 0 || mailbox.LastCodeMessageID != "" || !mailbox.LastCodeAt.IsZero()
+	if removed == 0 && !metadataChanged {
+		return 0, nil
+	}
+	s.state.Messages = next
+	mailbox.ReceiveCount = 0
+	mailbox.LastCodeMessageID = ""
+	mailbox.LastCodeAt = time.Time{}
+	mailbox.UpdatedAt = time.Now()
+	s.appendEventLocked("info", "mailbox", fmt.Sprintf("已清空本地邮件 %s：%d 封", mailbox.Email, removed))
+	return removed, s.saveLocked()
 }
 
 func (s *Store) DeleteMailboxMessagesByRemoteIDs(mailboxID string, remoteIDs []string) (int, error) {
