@@ -4,11 +4,13 @@
 >
 > 项目目录：`iCloud-Privacy-Mail-v2`
 >
+> 项目来源：[xiuxiu56/iCloud-Privacy-Mail-v2](https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2)
+>
 > 运行定位：单管理员、本地优先的 Apple 隐私邮箱管理工具
 
-本项目参考 [q1953258942/iCloud-Privacy-Mail](https://github.com/q1953258942/iCloud-Privacy-Mail) 的 Apple/iCloud 协议与邮件处理思路，在独立目录中重新划分后端边界，并使用 Vue 3 重建管理页面。项目已完成 SQLite 数据基座、SSE 实时更新、新版紧凑 UI、邮箱租约和后台任务队列。
+本项目在来源仓库中统一维护 Apple/iCloud 协议、Go 后端、Vue 3 管理页面和项目文档。当前版本已完成 SQLite 数据基座、SSE 实时更新、新版紧凑 UI、邮箱租约和后台任务队列。
 
-文档截图来自隔离演示实例，只含 `demo.*` 示例数据，不包含真实 Apple 账号、邮箱、Cookie、密码、Token 或邮件。
+文档截图由当前仓库源码重新构建，并从隔离演示实例采集，只含 `demo.*` 示例数据，不包含真实 Apple 账号、邮箱、Cookie、密码、Token 或邮件。
 
 ## 1. 能力概览
 

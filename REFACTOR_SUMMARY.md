@@ -1,6 +1,8 @@
 # 重构总结
 
 > 更新日期：2026-08-15
+>
+> 项目来源：[xiuxiu56/iCloud-Privacy-Mail-v2](https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2)
 
 ## 目标
 

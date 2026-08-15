@@ -1,8 +1,10 @@
 # iCloud Privacy Mail
 
+> 项目来源：[xiuxiu56/iCloud-Privacy-Mail-v2](https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2)
+
 单管理员、本地优先的 Apple 隐私邮箱管理工具。后端使用 Go，前端使用 Vue 3，业务数据统一存入 SQLite，并通过 SSE 将账号、邮箱、邮件、任务和运行事件实时同步到已登录页面。
 
-项目参考 [q1953258942/iCloud-Privacy-Mail](https://github.com/q1953258942/iCloud-Privacy-Mail) 的协议与数据处理思路，在独立目录中重组后端模块并重新设计管理页面。
+当前项目源码、文档、发行版本和后续更新均以 GitHub 项目来源仓库为准。
 
 ## 主要功能
 
@@ -62,7 +64,7 @@ go run main.go
 
 ## 新版页面
 
-新版 UI 采用紧凑型侧栏、统一卡片与表格、等高控件和响应式分页。下列截图来自隔离演示实例，只包含 `demo.*` 示例数据，不含真实 Apple 账号、Cookie、密码、Token 或邮件。
+新版 UI 采用紧凑型侧栏、统一卡片与表格、等高控件和响应式分页。下列截图由当前仓库源码重新构建，并从隔离演示实例采集，只包含 `demo.*` 示例数据，不含真实 Apple 账号、Cookie、密码、Token 或邮件。
 
 ### 登录与控制台
 
