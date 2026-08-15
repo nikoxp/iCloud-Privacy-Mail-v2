@@ -25,6 +25,7 @@ const (
 	ICloudStatusNeed2FA      = "need_2fa"
 	ICloudStatusNoICloudPlus = "no_icloud_plus"
 	ICloudStatusRateLimited  = "rate_limited"
+	ICloudStatusPartial      = "partial"
 	ICloudStatusFailed       = "failed"
 
 	LoginStateICloudWeb    = "icloud_web"

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -22,6 +23,12 @@ func (s *Store) FindAppleAccount(id string) (domain.AppleAccount, bool) {
 	defer s.mu.RUnlock()
 	var account domain.AppleAccount
 	found, err := s.readEntity("apple_accounts", strings.TrimSpace(id), &account)
+	if found && err == nil {
+		var session domain.ICloudSession
+		if sessionFound, sessionErr := s.readEntity("icloud_sessions", account.ID, &session); sessionErr == nil && sessionFound {
+			account.ICloudStatus = iCloudStatusFromSession(session)
+		}
+	}
 	return account, found && err == nil
 }
 
@@ -59,6 +66,13 @@ func (s *Store) saveICloudSession(session domain.ICloudSession, level, updateMes
 	accountID := strings.TrimSpace(session.AccountID)
 	var account domain.AppleAccount
 	accountCreated := false
+	if accountID == "" {
+		accountID, err = s.findAppleAccountIDBySessionTx(tx, session)
+		if err != nil {
+			_ = tx.Rollback()
+			return domain.ICloudSession{}, err
+		}
+	}
 	if accountID != "" {
 		if found, err := s.readEntityTx(tx, "apple_accounts", accountID, &account); err != nil || !found {
 			_ = tx.Rollback()
@@ -141,6 +155,52 @@ func (s *Store) saveICloudSession(session domain.ICloudSession, level, updateMes
 	return cloneICloudSession(session), s.commitTx(tx, changes)
 }
 
+// findAppleAccountIDBySessionTx 按 DSID 和 Apple ID 查找已有账号，保证重新登录时更新原记录。
+func (s *Store) findAppleAccountIDBySessionTx(tx *sql.Tx, session domain.ICloudSession) (string, error) {
+	dsid := strings.TrimSpace(session.DSID)
+	if dsid != "" {
+		var accountID string
+		err := tx.QueryRow(`SELECT id FROM icloud_sessions
+			WHERE trim(COALESCE(json_extract(data_json, '$.dsid'), '')) = ?
+			ORDER BY COALESCE(json_extract(data_json, '$.saved_at'), updated_at), id
+			LIMIT 1`, dsid).Scan(&accountID)
+		if err == nil {
+			return strings.TrimSpace(accountID), nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+
+	appleID := strings.TrimSpace(session.AppleID)
+	if appleID == "" {
+		return "", nil
+	}
+	var accountID string
+	err := tx.QueryRow(`SELECT id FROM apple_accounts
+		WHERE lower(trim(COALESCE(json_extract(data_json, '$.apple_id'), ''))) = lower(?)
+		ORDER BY COALESCE(json_extract(data_json, '$.created_at'), updated_at), id
+		LIMIT 1`, appleID).Scan(&accountID)
+	if err == nil {
+		return strings.TrimSpace(accountID), nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+
+	err = tx.QueryRow(`SELECT id FROM icloud_sessions
+		WHERE lower(trim(COALESCE(json_extract(data_json, '$.apple_id'), ''))) = lower(?)
+		ORDER BY COALESCE(json_extract(data_json, '$.saved_at'), updated_at), id
+		LIMIT 1`, appleID).Scan(&accountID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(accountID), nil
+}
+
 // DeleteAppleAccount 删除数据库中的 Apple 账号、登录态、关联邮箱、租约和邮件。
 func (s *Store) DeleteAppleAccount(id string) (DeleteAppleAccountResult, error) {
 	s.mu.Lock()
@@ -200,7 +260,31 @@ func (s *Store) UpdateICloudSession(accountID string, update func(*domain.ICloud
 }
 
 func iCloudStatusFromSession(session domain.ICloudSession) string {
-	if !session.LastCheckOK && !session.LastCheckedAt.IsZero() {
+	successes := 0
+	failures := 0
+	for _, state := range session.LoginStates {
+		if state.LastCheckedAt.IsZero() {
+			continue
+		}
+		if state.LastCheckOK {
+			successes++
+		} else {
+			failures++
+		}
+	}
+	if successes > 0 {
+		if failures > 0 {
+			return domain.ICloudStatusPartial
+		}
+		return domain.ICloudStatusActive
+	}
+	if failures > 0 {
+		return domain.ICloudStatusFailed
+	}
+	if !session.LastCheckedAt.IsZero() {
+		if session.LastCheckOK {
+			return domain.ICloudStatusActive
+		}
 		return domain.ICloudStatusFailed
 	}
 	if session.IsICloudPlus && session.CanCreateHME {
@@ -247,8 +331,7 @@ func mergeICloudSession(existing, incoming domain.ICloudSession) domain.ICloudSe
 	out.Note = firstNonEmpty(incoming.Note, existing.Note)
 	if out.LastCheckedAt.IsZero() {
 		out.LastCheckedAt = existing.LastCheckedAt
-	}
-	if strings.TrimSpace(out.LastStatusMessage) == "" {
+		out.LastCheckOK = existing.LastCheckOK
 		out.LastStatusMessage = existing.LastStatusMessage
 	}
 	return out

@@ -366,6 +366,18 @@ func (s *Store) AppleAccounts() []domain.AppleAccount {
 	defer s.mu.RUnlock()
 	var out []domain.AppleAccount
 	_ = s.loadEntities("apple_accounts", `json_extract(data_json, '$.created_at') DESC`, &out)
+	var sessions []domain.ICloudSession
+	if err := s.loadEntities("icloud_sessions", "", &sessions); err == nil {
+		byAccount := make(map[string]domain.ICloudSession, len(sessions))
+		for _, session := range sessions {
+			byAccount[session.AccountID] = session
+		}
+		for index := range out {
+			if session, ok := byAccount[out[index].ID]; ok {
+				out[index].ICloudStatus = iCloudStatusFromSession(session)
+			}
+		}
+	}
 	return out
 }
 

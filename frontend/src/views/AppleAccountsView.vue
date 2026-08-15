@@ -58,7 +58,7 @@ function finishBusy(action) {
 }
 
 function statusLabel(value) {
-  return ({ active: '正常', need_login: '需要登录', need_2fa: '等待 2FA', no_icloud_plus: '无 iCloud+', rate_limited: '访问受限', failed: '失败' })[value] || value || '未知'
+  return ({ active: '正常', partial: '部分正常', need_login: '需要登录', need_2fa: '等待 2FA', no_icloud_plus: '无 iCloud+', rate_limited: '访问受限', failed: '失败' })[value] || value || '未知'
 }
 
 function stateLabel(kind) {
@@ -88,7 +88,7 @@ function stateStatusClass(state) {
 function accountStatusClass(account) {
   const status = account.icloud_status || account.status
   if (status === 'active') return 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/30 dark:text-emerald-300'
-  if (status === 'need_2fa' || status === 'need_login') return 'bg-amber-50 text-amber-600 dark:bg-amber-950/30 dark:text-amber-300'
+  if (status === 'partial' || status === 'need_2fa' || status === 'need_login') return 'bg-amber-50 text-amber-600 dark:bg-amber-950/30 dark:text-amber-300'
   return 'bg-rose-50 text-rose-600 dark:bg-rose-950/30 dark:text-rose-300'
 }
 
