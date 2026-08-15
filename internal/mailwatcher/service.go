@@ -23,16 +23,17 @@ const (
 )
 
 type Service struct {
-	cfg          config.Config
-	store        *store.Store
-	mailbox      *mailboxservice.Service
-	log          *slog.Logger
-	wake         chan struct{}
-	activeMu     sync.Mutex
-	activeUntil  map[string]time.Time
-	statusMu     sync.RWMutex
-	status       Status
-	readyWorkers map[string]bool
+	cfg             config.Config
+	store           *store.Store
+	mailbox         *mailboxservice.Service
+	log             *slog.Logger
+	wake            chan struct{}
+	activeMu        sync.Mutex
+	activeUntil     map[string]time.Time
+	statusMu        sync.RWMutex
+	status          Status
+	readyWorkers    map[string]bool
+	lastPublishedAt time.Time
 }
 
 // Status 是后台监听的真实运行快照，避免仅根据配置开关误报“运行中”。
@@ -72,7 +73,7 @@ func NewService(cfg config.Config, state *store.Store, mailbox *mailboxservice.S
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{
+	service := &Service{
 		cfg:          cfg,
 		store:        state,
 		mailbox:      mailbox,
@@ -81,6 +82,16 @@ func NewService(cfg config.Config, state *store.Store, mailbox *mailboxservice.S
 		activeUntil:  make(map[string]time.Time),
 		readyWorkers: make(map[string]bool),
 	}
+	if state != nil {
+		var persisted Status
+		if found, err := state.LoadRuntimeState("mailwatcher", &persisted); err == nil && found {
+			persisted.Running = false
+			persisted.WorkerCount = 0
+			persisted.ConnectedWorkerCount = 0
+			service.status = persisted
+		}
+	}
+	return service
 }
 
 func (s *Service) Run(ctx context.Context) {
@@ -273,8 +284,40 @@ func (s *Service) Snapshot() Status {
 
 func (s *Service) updateStatus(update func(*Status)) {
 	s.statusMu.Lock()
-	defer s.statusMu.Unlock()
+	before := materialStatus(s.status)
 	update(&s.status)
+	after := materialStatus(s.status)
+	now := time.Now()
+	shouldPublish := before != after || s.lastPublishedAt.IsZero() || now.Sub(s.lastPublishedAt) >= 30*time.Second
+	snapshot := s.status
+	if shouldPublish {
+		s.lastPublishedAt = now
+	}
+	s.statusMu.Unlock()
+	if shouldPublish && s.store != nil {
+		_ = s.store.SaveRuntimeState("mailwatcher", snapshot, true)
+	}
+}
+
+type statusMaterial struct {
+	Running              bool
+	Enabled              bool
+	GroupCount           int
+	WorkerCount          int
+	ConnectedWorkerCount int
+	SyncedMessages       int
+	IdleEvents           int
+	LastError            string
+	LastIdleError        string
+}
+
+func materialStatus(status Status) statusMaterial {
+	return statusMaterial{
+		Running: status.Running, Enabled: status.Enabled, GroupCount: status.GroupCount,
+		WorkerCount: status.WorkerCount, ConnectedWorkerCount: status.ConnectedWorkerCount,
+		SyncedMessages: status.SyncedMessages, IdleEvents: status.IdleEvents,
+		LastError: status.LastError, LastIdleError: status.LastIdleError,
+	}
 }
 
 func (s *Service) recordSyncResult(count int, err error) {
@@ -304,21 +347,21 @@ func (s *Service) recordWatcherError(err error) {
 }
 
 func (s *Service) markWorkerReady(key string, ready bool) {
-	s.statusMu.Lock()
-	defer s.statusMu.Unlock()
-	if ready {
-		s.readyWorkers[key] = true
-	} else {
-		delete(s.readyWorkers, key)
-	}
-	s.status.ConnectedWorkerCount = len(s.readyWorkers)
+	s.updateStatus(func(status *Status) {
+		if ready {
+			s.readyWorkers[key] = true
+		} else {
+			delete(s.readyWorkers, key)
+		}
+		status.ConnectedWorkerCount = len(s.readyWorkers)
+	})
 }
 
 func (s *Service) resetReadyWorkers() {
-	s.statusMu.Lock()
-	defer s.statusMu.Unlock()
-	s.readyWorkers = make(map[string]bool)
-	s.status.ConnectedWorkerCount = 0
+	s.updateStatus(func(status *Status) {
+		s.readyWorkers = make(map[string]bool)
+		status.ConnectedWorkerCount = 0
+	})
 }
 
 func (s *Service) groups() []watchGroup {

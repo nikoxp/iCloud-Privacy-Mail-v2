@@ -12,12 +12,18 @@ export async function api(path, options = {}) {
   if (options.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  const response = await fetch(path, {
-    credentials: 'same-origin',
-    cache: path.startsWith('/api/') ? 'no-store' : 'default',
-    ...options,
-    headers,
-  })
+  let response
+  try {
+    response = await fetch(path, {
+      credentials: 'same-origin',
+      cache: path.startsWith('/api/') ? 'no-store' : 'default',
+      ...options,
+      headers,
+    })
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new ApiError('请求已取消')
+    throw new ApiError('连接服务器失败，请检查网络或稍后重试')
+  }
   let payload = null
   try {
     payload = await response.json()

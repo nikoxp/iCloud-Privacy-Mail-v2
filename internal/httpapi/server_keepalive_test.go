@@ -28,7 +28,7 @@ func TestAppleKeepAliveScanIntervalPollsBeforeBaseInterval(t *testing.T) {
 }
 
 func TestAPIResponsesDisableCaching(t *testing.T) {
-	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
 		t.Fatalf("创建测试状态失败：%v", err)
 	}
@@ -137,7 +137,7 @@ func TestRunAppleKeepAliveChecksImmediately(t *testing.T) {
 }
 
 func TestMailWatcherSettingTakesEffectWithoutRestart(t *testing.T) {
-	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
 		t.Fatalf("创建测试状态失败：%v", err)
 	}
@@ -190,7 +190,7 @@ func assertKeepAliveEvent(t *testing.T, state *store.Store, text string) {
 
 func newKeepAliveTestState(t *testing.T, lastCheckOK bool, lastCheckedAt time.Time) (*store.Store, domain.ICloudSession) {
 	t.Helper()
-	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
 		t.Fatalf("创建测试状态失败：%v", err)
 	}

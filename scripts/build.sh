@@ -27,7 +27,6 @@ mkdir -p "$PROJECT_ROOT/bin"
 
   cd "$PROJECT_ROOT"
   go build -trimpath -ldflags "$BUILD_LDFLAGS" -o "$PROJECT_ROOT/bin/ipm-server" .
-  go build -trimpath -ldflags "$BUILD_LDFLAGS" -o "$PROJECT_ROOT/bin/ipm-migrate" ./cmd/migrate
 )
 
 echo "构建完成，版本 ${APP_VERSION}，提交 ${APP_COMMIT:0:7}，服务程序位于 bin/ipm-server。"

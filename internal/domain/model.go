@@ -151,7 +151,6 @@ type Event struct {
 }
 
 type Settings struct {
-	MailboxPageSize         int    `json:"mailbox_page_size"`
 	EnableMailWatcher       bool   `json:"enable_mail_watcher"`
 	EnableAppleKeepAlive    bool   `json:"enable_apple_keep_alive"`
 	EnablePublicMailboxAPI  bool   `json:"enable_public_mailbox_api"`
@@ -161,18 +160,19 @@ type Settings struct {
 }
 
 type CreateSettings struct {
-	OwnerID                       string    `json:"owner_id,omitempty"`
-	Label                         string    `json:"label,omitempty"`
-	Note                          string    `json:"note,omitempty"`
-	AccountIDs                    []string  `json:"account_ids,omitempty"`
-	CreateChannel                 string    `json:"create_channel,omitempty"`
-	SchedulerCreateChannel        string    `json:"scheduler_create_channel,omitempty"`
-	AppleAccountTwoFactorMethod   string    `json:"apple_account_two_factor_method,omitempty"`
-	ICloudWebTwoFactorMethod      string    `json:"icloud_web_two_factor_method,omitempty"`
-	SchedulerIntervalMinutes      int       `json:"scheduler_interval_minutes,omitempty"`
-	SchedulerRoundIntervalSeconds int       `json:"scheduler_round_interval_seconds,omitempty"`
-	MailboxPageSize               int       `json:"mailbox_page_size,omitempty"`
-	UpdatedAt                     time.Time `json:"updated_at,omitempty"`
+	OwnerID                            string    `json:"owner_id,omitempty"`
+	Label                              string    `json:"label,omitempty"`
+	Note                               string    `json:"note,omitempty"`
+	AccountIDs                         []string  `json:"account_ids,omitempty"`
+	CreateChannel                      string    `json:"create_channel,omitempty"`
+	SchedulerCreateChannel             string    `json:"scheduler_create_channel,omitempty"`
+	AppleAccountTwoFactorMethod        string    `json:"apple_account_two_factor_method,omitempty"`
+	ICloudWebTwoFactorMethod           string    `json:"icloud_web_two_factor_method,omitempty"`
+	SchedulerIntervalMinMinutes        int       `json:"scheduler_interval_min_minutes,omitempty"`
+	SchedulerIntervalMaxMinutes        int       `json:"scheduler_interval_max_minutes,omitempty"`
+	SchedulerAccountIntervalMinSeconds int       `json:"scheduler_account_interval_min_seconds,omitempty"`
+	SchedulerAccountIntervalMaxSeconds int       `json:"scheduler_account_interval_max_seconds,omitempty"`
+	UpdatedAt                          time.Time `json:"updated_at,omitempty"`
 }
 
 type ICloudSession struct {
@@ -265,7 +265,6 @@ type Task struct {
 
 func DefaultSettings() Settings {
 	return Settings{
-		MailboxPageSize:         7,
 		EnableMailWatcher:       false,
 		EnableAppleKeepAlive:    false,
 		EnablePublicMailboxAPI:  false,
@@ -276,13 +275,14 @@ func DefaultSettings() Settings {
 
 func DefaultCreateSettings() CreateSettings {
 	return CreateSettings{
-		Label:                         "x",
-		CreateChannel:                 "auto",
-		SchedulerCreateChannel:        "auto",
-		AppleAccountTwoFactorMethod:   "trusted_device",
-		ICloudWebTwoFactorMethod:      "trusted_device",
-		SchedulerIntervalMinutes:      60,
-		SchedulerRoundIntervalSeconds: 5,
-		MailboxPageSize:               7,
+		Label:                              "x",
+		CreateChannel:                      "auto",
+		SchedulerCreateChannel:             "auto",
+		AppleAccountTwoFactorMethod:        "trusted_device",
+		ICloudWebTwoFactorMethod:           "trusted_device",
+		SchedulerIntervalMinMinutes:        60,
+		SchedulerIntervalMaxMinutes:        60,
+		SchedulerAccountIntervalMinSeconds: 5,
+		SchedulerAccountIntervalMaxSeconds: 5,
 	}
 }

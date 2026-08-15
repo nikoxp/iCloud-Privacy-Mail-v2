@@ -101,7 +101,7 @@ func TestPublicMailboxLeaseEmailCompatibilityAndNote(t *testing.T) {
 
 func newMailboxLeaseTestServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
-	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
 		t.Fatalf("创建测试状态失败：%v", err)
 	}

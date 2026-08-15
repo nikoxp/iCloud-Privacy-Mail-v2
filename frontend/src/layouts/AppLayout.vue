@@ -1,11 +1,12 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
-import { Activity, LogOut, Menu, UserCircle } from '@lucide/vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { Activity, ChevronDown, LogOut, Menu, UserRound } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import Sidebar from '../components/Sidebar.vue'
 import AnnouncementCenter from '../components/AnnouncementCenter.vue'
 import ThemeToggle from '../components/ThemeToggle.vue'
 import { useAuth } from '../composables/useAuth'
+import { connectRealtime, disconnectRealtime, realtimeState } from '../composables/useRealtime'
 
 const route = useRoute()
 const router = useRouter()
@@ -16,6 +17,12 @@ const profileOpen = ref(false)
 
 const title = computed(() => route.meta.title || '控制台')
 const subtitle = computed(() => route.meta.subtitle || '')
+const realtimeText = computed(() => ({
+  connected: '实时已连接',
+  connecting: '实时连接中',
+  reconnecting: '实时重连中',
+  closed: '实时已断开',
+}[realtimeState.status] || '实时状态未知'))
 
 function applyTheme(value) {
   dark.value = value
@@ -23,10 +30,18 @@ function applyTheme(value) {
   localStorage.setItem('ipm_v2_theme', value ? 'dark' : 'light')
 }
 
+function handleKeydown(event) {
+  if (event.key === 'Escape') {
+    profileOpen.value = false
+    sidebarOpen.value = false
+  }
+}
+
 async function signOut() {
   try {
     await logout()
   } finally {
+    disconnectRealtime()
     profileOpen.value = false
     router.replace({ name: 'login' })
   }
@@ -35,36 +50,46 @@ async function signOut() {
 onMounted(() => {
   const saved = localStorage.getItem('ipm_v2_theme')
   applyTheme(saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches)
+  window.addEventListener('keydown', handleKeydown)
+  connectRealtime()
+})
+
+onBeforeUnmount(() => {
+  disconnectRealtime()
+  window.removeEventListener('keydown', handleKeydown)
 })
 </script>
 
 <template>
-  <div class="flex h-screen overflow-hidden bg-slate-50 text-slate-800 transition-colors dark:bg-slate-950 dark:text-slate-100">
+  <div class="app-shell">
     <Sidebar :open="sidebarOpen" :dark="dark" @close="sidebarOpen = false" @toggle-theme="applyTheme(!dark)" />
-    <div class="flex min-h-0 min-w-0 flex-1 flex-col">
-      <header class="sticky top-0 z-20 flex h-16 shrink-0 items-center justify-between border-b border-slate-200/80 bg-white/85 px-4 backdrop-blur-md dark:border-slate-800 dark:bg-slate-900/85 md:px-7">
-        <div class="flex min-w-0 items-center gap-3">
-          <button class="rounded-xl p-2 text-slate-500 hover:bg-slate-100 md:hidden dark:hover:bg-slate-800" title="打开导航" @click="sidebarOpen = true"><Menu :size="20" /></button>
-          <div class="min-w-0">
-            <div class="flex items-center gap-2 text-sm font-bold text-slate-800 dark:text-slate-100"><span class="hidden text-slate-400 sm:inline">控制台</span><span class="hidden text-slate-300 sm:inline">/</span><span class="truncate">{{ title }}</span></div>
-            <div class="hidden truncate text-xs text-slate-400 sm:block">{{ subtitle }}</div>
+    <div class="main-shell">
+      <header class="topbar">
+        <div class="topbar-heading">
+          <button class="mobile-nav-button" title="打开导航" aria-label="打开导航" @click="sidebarOpen = true"><Menu :size="19" /></button>
+          <div class="topbar-title">
+            <div class="breadcrumb"><span>控制台</span><b>/</b><strong>{{ title }}</strong></div>
+            <p>{{ subtitle }}</p>
           </div>
         </div>
-        <div class="flex items-center gap-2 sm:gap-4">
-          <span class="hidden items-center gap-2 text-xs font-medium text-slate-400 lg:flex"><Activity :size="15" class="text-emerald-500" />本地模式</span>
-          <ThemeToggle :dark="dark" class="hidden sm:flex" @toggle="applyTheme(!dark)" />
+        <div class="topbar-actions">
+          <span class="realtime-mode" :class="`realtime-${realtimeState.status}`" :title="realtimeText"><i />{{ realtimeText }}</span>
+          <span class="local-mode"><Activity :size="14" />本地模式</span>
+          <ThemeToggle :dark="dark" @toggle="applyTheme(!dark)" />
           <AnnouncementCenter />
-          <div class="relative">
-            <button class="flex items-center gap-2 rounded-xl p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800" @click="profileOpen = !profileOpen"><UserCircle :size="27" class="text-emerald-500" /><span class="hidden max-w-28 truncate text-xs font-bold sm:block">{{ authState.admin?.username || '管理员' }}</span></button>
-            <div v-if="profileOpen" class="absolute right-0 top-12 w-48 rounded-xl border border-slate-200 bg-white p-2 shadow-xl dark:border-slate-700 dark:bg-slate-800">
-              <div class="border-b border-slate-100 px-3 py-2 text-xs text-slate-400 dark:border-slate-700">单用户本地控制台</div>
-              <button class="mt-1 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/30" @click="signOut"><LogOut :size="15" />退出登录</button>
+          <div class="profile-menu">
+            <button class="profile-trigger" :aria-expanded="profileOpen" aria-label="打开管理员菜单" @click="profileOpen = !profileOpen"><span class="admin-avatar"><UserRound :size="16" /></span><span>{{ authState.admin?.username || '管理员' }}</span><ChevronDown :size="14" /></button>
+            <div v-if="profileOpen" class="profile-dropdown">
+              <div><strong>{{ authState.admin?.username || '管理员' }}</strong><small>单用户本地控制台</small></div>
+              <button @click="signOut"><LogOut :size="15" />退出登录</button>
             </div>
           </div>
         </div>
       </header>
-      <main class="min-h-0 flex-1 overflow-y-auto p-4 md:p-7">
-        <Transition name="page" mode="out-in"><RouterView /></Transition>
+      <main class="page-scroll">
+        <RouterView v-slot="{ Component }">
+          <Transition name="page" mode="out-in"><component :is="Component" /></Transition>
+        </RouterView>
       </main>
     </div>
   </div>

@@ -33,7 +33,7 @@ func main() {
 	flag.StringVar(&options.ConfigPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&options.Host, "host", "", "覆盖监听地址")
 	flag.IntVar(&options.Port, "port", 0, "覆盖监听端口")
-	flag.StringVar(&options.DataPath, "data", "", "覆盖状态文件路径")
+	flag.StringVar(&options.DataPath, "data", "", "覆盖 SQLite 数据库路径")
 	flag.BoolVar(&showMenu, "menu", false, "显示交互式启动菜单")
 	flag.Parse()
 
@@ -57,8 +57,9 @@ func runServer(options launchOptions, logger *slog.Logger) error {
 	}
 	state, err := store.Open(cfg.DataPath)
 	if err != nil {
-		return fmt.Errorf("打开状态文件失败：%w", err)
+		return fmt.Errorf("打开数据存储失败：%w", err)
 	}
+	defer state.Close()
 
 	handler := httpapi.New(cfg, state, logger)
 	server := &http.Server{
@@ -161,7 +162,7 @@ func customizeLaunchOptions(reader *bufio.Reader, options *launchOptions) {
 			fmt.Println("端口格式不正确，将继续使用配置文件中的端口。")
 		}
 	}
-	fmt.Printf("数据文件 [%s]：", displayDefault(options.DataPath, "使用配置文件"))
+	fmt.Printf("数据库 [%s]：", displayDefault(options.DataPath, "使用配置文件"))
 	if value := readMenuLine(reader); value != "" {
 		options.DataPath = value
 	}
@@ -177,7 +178,7 @@ func printEffectiveConfig(options launchOptions) {
 	fmt.Println("当前生效配置：")
 	fmt.Println("  配置文件：", options.ConfigPath)
 	fmt.Printf("  服务地址：http://%s:%d\n", cfg.Host, cfg.Port)
-	fmt.Println("  数据文件：", cfg.DataPath)
+	fmt.Println("  数据库：", cfg.DataPath)
 	fmt.Println("  邮件监听：", enabledText(cfg.MailWatcherEnabled))
 	fmt.Println("  Apple 保活：", enabledText(cfg.AppleAccountKeepAliveEnabled))
 }

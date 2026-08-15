@@ -1,24 +1,27 @@
 # iCloud Privacy Mail
 
-单管理员、本地优先的 Apple 隐私邮箱管理工具。后端使用 Go，管理页面使用 Vue 3，支持 Apple/iCloud 登录、IMAP、隐私邮箱、验证码、自动创建、公共接口和本地导出。
+单管理员、本地优先的 Apple 隐私邮箱管理工具。后端使用 Go，前端使用 Vue 3，业务数据统一存入 SQLite，并通过 SSE 将账号、邮箱、邮件、任务和运行事件实时同步到已登录页面。
 
-项目参考 [q1953258942/iCloud-Privacy-Mail](https://github.com/q1953258942/iCloud-Privacy-Mail) 的协议和数据处理思路，在独立目录中重新组织后端模块并重建前端页面。
+项目参考 [q1953258942/iCloud-Privacy-Mail](https://github.com/q1953258942/iCloud-Privacy-Mail) 的协议与数据处理思路，在独立目录中重组后端模块并重新设计管理页面。
 
 ## 主要功能
 
-- Apple Account 新接口、iCloud Web 旧接口登录和两步验证。
-- iCloud IMAP App 专用密码、IDLE 监听、邮件同步和验证码提取。
-- 隐私邮箱创建、同步、导入、筛选、状态、远端清理和远端删除。
-- 邮箱池支持点击邮箱复制、标签/备注双行展示、备注与状态快捷编辑，以及带二次确认的串行删除队列。
-- 单次创建与多账号自动创建，默认生成 `x_1`、`x_2` 等连续标签。
-- 公共取号租约 API、邮箱独立取码 API、独立公共验证码页面；邮箱只在租约提交后标记为已使用。
+- Apple Account 新接口、iCloud Web 旧接口登录、两步验证、登录态检测与后台保活。
+- iCloud IMAP App 专用密码验证、IMAP IDLE 监听、按账号批量同步、验证码提取与点击复制。
+- 隐私邮箱创建、远端同步、手动导入、搜索筛选、状态和备注编辑。
+- 邮箱池按浏览器可视高度自动计算分页容量，支持表格多选、详情、取码和邮箱地址点击复制。
+- 全量 Apple 邮件清理、按目标邮箱清理、单个或批量彻底删除邮箱；后台队列独立执行并持续显示账号、邮箱和完成进度。
+- 单次创建与多账号自动创建；轮次间隔和账号间隔均支持随机范围，创建失败时自动停止。
+- 公共取号租约 API、邮箱独立取码 API、公共验证码页面。
 - 运行数据、邮件、邮箱地址和取码 API 本地导出。
-- GitHub Release/默认分支版本检查、侧栏版本展示和顶部公告中心。
+- SQLite WAL、敏感字段 AES-GCM 加密、在线备份、完整性检查、空间整理和保留期清理。
+- SSE 事件序号、持久化变更日志、断线回放、心跳和页面自动刷新。
+- GitHub Release/默认分支版本检查、侧栏版本信息与公告中心。
 - 单管理员登录保护；无多用户注册和 `/manage` 页面。
 
 ## 快速启动
 
-要求 Go 1.25 或更高版本，以及满足 Vite 8 要求的 Node.js/npm。
+`go.mod` 的最低 Go 版本为 1.25。由于本次依赖扫描发现 Go 1.26.5 标准库存在已修复漏洞，实际构建推荐使用 Go 1.26.6 或更新的补丁版本。前端需要满足 Vite 8 要求的 Node.js/npm。
 
 ```bash
 cp config.example.json config.json
@@ -34,27 +37,22 @@ http://127.0.0.1:8788/
 
 项目没有默认密码。首次打开页面时创建唯一的本地管理员，之后使用该账号登录。
 
-直接按配置启动：
+常用命令：
 
 ```bash
+# 直接按配置启动
 go run main.go -config config.json
-```
 
-运行已构建程序：
-
-```bash
+# 运行构建产物
 ./bin/ipm-server -config config.json
-```
 
-开发模式：
-
-```bash
+# 前后端开发模式
 ./scripts/dev.sh
 ```
 
-Vue 开发地址为 `http://127.0.0.1:5174/`，Go API 地址为 `http://127.0.0.1:8788/`。
+开发模式下 Vue 地址为 `http://127.0.0.1:5174/`，Go API 地址为 `http://127.0.0.1:8788/`。
 
-`go run main.go` 使用 `internal/webui/dist` 中的 Go 内嵌前端资源，不会直接读取 `frontend/src`。修改前端后如果要在 `http://127.0.0.1:8788/` 查看效果，请在项目根目录执行：
+`go run main.go` 使用 `internal/webui/dist` 中的嵌入式资源。修改 `frontend/src` 后若要在 8788 端口查看新页面，请执行：
 
 ```bash
 npm --prefix frontend run build
@@ -62,103 +60,94 @@ npm --prefix frontend run build
 go run main.go
 ```
 
-## 页面
+## 新版页面
+
+新版 UI 采用紧凑型侧栏、统一卡片与表格、等高控件和响应式分页。下列截图来自隔离演示实例，只包含 `demo.*` 示例数据，不含真实 Apple 账号、Cookie、密码、Token 或邮件。
+
+### 登录与控制台
+
+![新版登录页](./docs/screenshots/ui/00-login.jpg)
+
+![新版控制台](./docs/screenshots/ui/01-dashboard.jpg)
+
+控制台展示 Apple 账号、隐私邮箱、邮件和后台能力汇总；运行记录使用与调度日志一致的紧凑表格，内容按列居中，表底与浏览器底部间距会随可显示行数调整。
+
+### Apple 账号
+
+![Apple 账号列表](./docs/screenshots/ui/02-apple-accounts.jpg)
+
+![Apple 账号登录态详情](./docs/screenshots/ui/02b-apple-account-detail.jpg)
+
+点击账号整行即可打开登录态详情和检测结果。页面集中提供 Apple Account、iCloud Web、IMAP 的登录、检测、保存、创建与同步入口。
+
+### 邮箱池
+
+![邮箱池](./docs/screenshots/ui/03-mailboxes.jpg)
+
+![邮箱详情](./docs/screenshots/ui/03b-mailbox-detail.jpg)
+
+表格支持 ID 和复选框、邮箱点击复制、标签/备注、状态、API/iCloud、收件数和最近同步。每行同步、取码或删除只影响当前任务，不会连带禁用其他无关按钮。
+
+### 创建隐私邮箱
+
+![创建隐私邮箱](./docs/screenshots/ui/04-tasks.jpg)
+
+![创建与调度设置](./docs/screenshots/ui/04b-task-settings.jpg)
+
+创建页支持单次与自动执行。设置弹窗使用“最小值—最大值”普通文本输入框配置下一轮随机分钟范围和账号随机秒数范围，不显示数字输入框的上下调节按钮。
+
+### 导出、设置与公共取码
+
+![本地导出](./docs/screenshots/ui/05-exports.jpg)
+
+![系统设置](./docs/screenshots/ui/06-settings.jpg)
+
+![公共验证码页面](./docs/screenshots/ui/07-verification-code.jpg)
+
+## 页面路由
 
 | 路由 | 功能 |
 | --- | --- |
 | `/login` | 首次创建管理员、后续登录 |
 | `/` | 账号、邮箱、邮件统计，运行记录和后台状态 |
-| `/apple-accounts` | Apple 登录、2FA、登录态检测、IMAP、创建和同步 |
-| `/mailboxes` | 搜索筛选、点击复制、快捷编辑、详情、邮件、取码、远端清理和串行彻底删除 |
-| `/tasks` | 创建一个邮箱、自动创建、默认值和调度日志 |
-| `/exports` | 运行数据、邮件、邮箱和 API 导出 |
-| `/settings` | 本地数据、后台能力、公共访问、API Key 和版本检查 |
-| `/verification-code` | 面向外部用户的独立公共验证码页面 |
+| `/apple-accounts` | Apple 登录、2FA、登录态详情与检测、IMAP、创建和同步 |
+| `/mailboxes` | 搜索筛选、多选、详情、取码、邮件清理和邮箱删除 |
+| `/tasks` | 单次创建、自动创建、随机调度设置和调度日志 |
+| `/exports` | 运行数据、邮件、邮箱地址和 API 导出 |
+| `/settings` | SQLite 维护、后台能力、公共访问、API Key 和版本检查 |
+| `/verification-code` | 面向外部调用者的公共验证码页面 |
 
-所有空数据页面截图、逐页操作说明、接口、配置、结构和技术栈见 [完整项目指南](PROJECT_GUIDE.md)。
+逐页操作说明见 [完整项目指南](PROJECT_GUIDE.md)。
 
-## 页面截图
+## SQLite 与实时更新
 
-以下截图来自隔离的空数据实例，只包含浏览器页面，不含真实 Apple 账号、邮箱、Cookie、密码或邮件。
+`data/app.db` 是唯一业务数据源，服务不再读取或生成 `state.json`。数据库启用 WAL、关系约束、事务和原生 SQL 分页；Apple Cookie、登录态、IMAP App 专用密码、邮箱 API Token 和公共 API Key 使用 `data/app.db.key` 进行 AES-GCM 加密。
 
-### 登录页
+数据库、密钥和配置文件使用 `0600`，数据目录使用 `0700`。在线备份会同时生成 `.db` 与 `.db.key`，恢复时必须成对使用。系统设置页提供：
 
-![登录页](./docs/screenshots/empty/00-login.jpg)
+- 数据库状态与 schema 版本。
+- 完整性检查。
+- 在线备份。
+- WAL checkpoint 与空间整理。
+- 默认 90 天邮件保留和 14 天备份保留。
 
-### 控制台
+前端登录后连接 `GET /api/realtime`。服务把变化写入 `change_log` 并发送递增事件序号；浏览器通过 `Last-Event-ID` 断线续传，收到对应主题后只刷新受影响页面。SSE 断开不影响业务操作，页面仍可通过普通 API 加载数据。
 
-![控制台](./docs/screenshots/empty/01-dashboard.jpg)
+## Apple 邮件清理与邮箱删除
 
-### Apple 账号
-
-![Apple 账号](./docs/screenshots/empty/02-apple-accounts.jpg)
-
-### 邮箱池
-
-![邮箱池](./docs/screenshots/empty/03-mailboxes.jpg)
-
-### 创建隐私邮箱
-
-![创建隐私邮箱](./docs/screenshots/empty/04-tasks.jpg)
-
-### 本地导出
-
-![本地导出](./docs/screenshots/empty/05-exports.jpg)
-
-### 系统设置
-
-![系统设置](./docs/screenshots/empty/06-settings.jpg)
-
-### 公共验证码页面
-
-![公共验证码页面](./docs/screenshots/empty/07-verification-code.jpg)
-
-## 项目结构
+“全部彻底清理 Apple 邮件”按 Apple 账号扫描全部远端邮件文件夹，统一把 Apple 内部文件夹名转换成中文展示，并显示：
 
 ```text
-iCloud-Privacy-Mail-v2/
-├── main.go                  # Go 服务主入口和中文启动菜单
-├── cmd/migrate/             # 旧状态迁移工具
-├── internal/
-│   ├── auth/                # 单管理员和会话
-│   ├── buildinfo/           # 二进制版本、提交和构建信息
-│   ├── apple/               # Apple 登录态和保活
-│   ├── mailbox/             # 邮箱、邮件、验证码和远端操作
-│   ├── mailwatcher/         # IMAP IDLE 和批量同步
-│   ├── scheduler/           # 自动创建调度
-│   ├── protocol/            # Apple、iCloud、IMAP 协议客户端
-│   ├── store/               # schema 4 JSON 状态存储和邮箱租约
-│   ├── updatecheck/         # GitHub 版本检查与项目公告
-│   ├── httpapi/             # 管理 API、公共 API 和导出
-│   └── webui/               # Go 嵌入式前端资源
-├── frontend/                # Vue 3 + Vue Router + Tailwind CSS
-├── scripts/                 # 开发、构建和资源同步
-├── docs/                    # 架构、迁移、审计和页面截图
-├── PROJECT_GUIDE.md         # 完整使用与技术文档
-└── config.example.json
+Apple 账号 N｜邮箱 M｜执行中 X｜排队中 Y｜已完成 A/M（成功 B，失败 C）
 ```
 
-## 版本检查与公告
+邮件为空时仍会完成账号扫描，发现数、移入废纸篓数和彻底删除数均显示为 0。按邮箱清理只处理目标隐私邮箱收到的邮件；彻底删除邮箱会先清理该邮箱的远端邮件，再删除 Apple 云端邮箱，远端确认成功后才删除本地记录。
 
-左侧导航底部显示当前版本和构建提交。进入“系统设置 → 版本与更新”可以检查 `update_repository` 对应仓库的最新 GitHub Release；仓库没有 Release 时会比较默认分支的最新提交。顶部铃铛显示版本消息和项目公告，已读状态只保存在当前浏览器。
-
-当前功能只负责检查和打开 GitHub 页面，不会下载或替换正在运行的程序。项目公告维护在 `internal/updatecheck/announcements.json`，远端内容按纯文本显示。完整构建脚本会把版本、Git commit 和构建时间写入二进制；在 Git tag 上构建时使用 tag 作为版本号，也可以通过 `IPM_VERSION` 指定版本。
-
-## 数据迁移
-
-```bash
-./bin/ipm-migrate \
-  -source /PATH/TO/OLD/data/state.json \
-  -target data/state.json
-```
-
-迁移工具会导入管理员、Apple 账号、邮箱、邮件、创建设置和 Apple 登录态，并升级到 schema 4。旧 Web 会话不会迁移，迁移后需要重新登录。覆盖已存在目标时先备份，再增加 `-force`。
+批量任务使用独立队列。点击一个同步、清理、取码或删除按钮时，只禁用当前行或同一资源上冲突的操作，其他账号和邮箱仍可继续操作。
 
 ## 公共邮箱租约
 
-`POST /api/v1/mailboxes/claim` 现在执行 `available → reserved`，响应同时返回 `mailbox` 和 `lease`。调用方应为每个业务请求发送稳定的 `request_id`，服务会按 `project + request_id` 返回同一租约，避免领取响应超时后重复消耗邮箱。
-
-注册结果对应动作：
+`POST /api/v1/mailboxes/claim` 执行 `available → reserved`，响应返回 `mailbox` 和 `lease`。调用方应为一个业务请求提供稳定的 `request_id`，服务会按 `project + request_id` 返回同一租约，避免超时重试重复消耗邮箱。
 
 ```text
 注册成功       POST /api/v1/mailbox-leases/{lease_id}/commit
@@ -168,24 +157,40 @@ iCloud-Privacy-Mail-v2/
 查询租约       GET  /api/v1/mailbox-leases/{lease_id}?project=PROJECT
 ```
 
-`commit` 才会执行 `reserved → used`；`release` 和超时回收会恢复为 `available`。动作请求均需提交全局 API Key 和 `project`。`claim`、`commit`、`release` 支持幂等重试，备注使用 `note` 字段。旧版按邮箱调用的 `/api/v1/mailboxes/{email}/commit|release|renew` 继续作为兼容入口。
+`commit` 才会执行 `reserved → used`；`release` 和超时回收会恢复为 `available`。生产调用推荐使用 `X-API-Key` 或 `Authorization: Bearer TOKEN` 请求头，不要把 Key 放入 URL 查询参数。
 
-## 数据与安全
+## 项目结构
 
-状态默认保存在 `data/state.json`，包含 Apple Cookie、登录态、IMAP App 专用密码、邮箱 API Token 和公共 API Key。程序以 `0600` 权限保存状态文件；`config.json` 中写入 Key 后也建议执行：
-
-```bash
-chmod 600 config.json
+```text
+iCloud-Privacy-Mail-v2/
+├── main.go                  # Go 服务主入口和中文启动菜单
+├── internal/
+│   ├── auth/                # 单管理员和会话
+│   ├── apple/               # Apple 登录态和保活
+│   ├── mailbox/             # 邮箱、邮件、验证码和远端操作
+│   ├── mailwatcher/         # IMAP IDLE 与批量同步
+│   ├── scheduler/           # 自动创建调度、日志和恢复
+│   ├── protocol/            # Apple、iCloud、IMAP 协议客户端
+│   ├── store/               # SQLite、字段加密、事务和变更日志
+│   ├── httpapi/             # 管理 API、公共 API、SSE 和数据库维护
+│   └── webui/               # Go 嵌入式前端资源
+├── frontend/                # Vue 3 + Vue Router + Tailwind CSS
+├── scripts/                 # 开发、构建和资源同步
+├── docs/                    # 架构、维护、审计和新版截图
+├── PROJECT_GUIDE.md         # 完整使用与技术文档
+└── config.example.json
 ```
 
-默认配置面向本机使用。公网部署前需要完成 Host 校验、HTTPS、Secure Cookie、Origin/CSRF 校验、登录与公共接口限流、公共验证码访问控制和敏感状态加密。
+## 安全提示
 
-最新代码审计、风险等级、扫描结果和修复顺序见 [代码与安全审计](docs/07-代码与安全审计.md)。
+本地使用建议保持 `host=127.0.0.1`，公共取号和公共验证码按需启用。直接部署到公网前，至少应完成 Host allowlist、HTTPS、`secure_cookie=true`、登录和公共接口限流、管理写接口 Origin/CSRF 校验、公共验证码访问控制及可信反向代理配置。
+
+本次审计确认 Go 1.26.5 标准库存在 5 条代码可达漏洞，均标记在 Go 1.26.6 修复，因此推荐升级 Go 后重新构建。完整扫描结果、人工复核和修复优先级见 [代码与安全审计](docs/07-代码与安全审计.md)。
 
 ## 文档
 
 - [完整项目指南](PROJECT_GUIDE.md)
 - [代码与安全审计](docs/07-代码与安全审计.md)
-- [迁移指南](docs/04-迁移指南.md)
+- [SQLite 升级与恢复](docs/04-迁移指南.md)
 - [项目结构](docs/05-项目结构.md)
 - [重构总结](REFACTOR_SUMMARY.md)

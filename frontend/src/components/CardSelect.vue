@@ -106,7 +106,7 @@ onBeforeUnmount(() => {
     <div v-if="open" ref="menu" class="card-select-menu" :style="{ maxHeight: menuMaxHeight || undefined }" role="listbox" :aria-label="ariaLabel" :aria-multiselectable="multiple || undefined">
       <button v-for="option in options" :key="String(option.value)" type="button" class="card-select-option" :class="isSelected(option.value) ? 'card-select-option-selected' : ''" :disabled="option.disabled" :aria-selected="isSelected(option.value)" role="option" :title="option.label" @click="selectOption(option)">
         <span class="card-select-dot" :class="option.dot || (isSelected(option.value) ? 'bg-emerald-500' : 'bg-slate-400')" />
-        <span class="min-w-0 flex-1"><strong class="block truncate">{{ option.label }}</strong><small v-if="option.description" class="mt-0.5 block truncate text-[10px] font-normal text-slate-400">{{ option.description }}</small></span>
+        <span class="min-w-0 flex-1"><strong class="block truncate">{{ option.label }}</strong><small v-if="option.description" class="mt-0.5 block truncate text-[9px] leading-3 font-normal text-slate-400">{{ option.description }}</small></span>
         <Check v-if="isSelected(option.value)" :size="13" class="shrink-0" />
       </button>
       <div v-if="!options.length" class="px-3 py-4 text-center text-xs text-slate-400">暂无可选项</div>
