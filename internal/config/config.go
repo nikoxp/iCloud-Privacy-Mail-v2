@@ -32,6 +32,10 @@ type Config struct {
 	PublicMailboxLeaseTTLMinutes       int    `json:"public_mailbox_lease_ttl_minutes"`
 	PublicMailboxLeaseMaxTTLMinutes    int    `json:"public_mailbox_lease_max_ttl_minutes"`
 	PublicMailboxLeaseSweepSeconds     int    `json:"public_mailbox_lease_sweep_seconds"`
+	DatabaseBackupDir                  string `json:"database_backup_dir"`
+	DatabaseBackupRetentionDays        int    `json:"database_backup_retention_days"`
+	DatabaseMessageRetentionDays       int    `json:"database_message_retention_days"`
+	DatabaseChangeLogLimit             int    `json:"database_change_log_limit"`
 	UpdateEnabled                      bool   `json:"update_enabled"`
 	UpdateRepository                   string `json:"update_repository"`
 }
@@ -40,7 +44,7 @@ func Default() Config {
 	return Config{
 		Host:                               "127.0.0.1",
 		Port:                               8788,
-		DataPath:                           filepath.Join("data", "state.json"),
+		DataPath:                           filepath.Join("data", "app.db"),
 		SessionTTLHours:                    24 * 7,
 		SecureCookie:                       false,
 		ICloudDefaultHost:                  "www.icloud.com.cn",
@@ -58,6 +62,10 @@ func Default() Config {
 		PublicMailboxLeaseTTLMinutes:       30,
 		PublicMailboxLeaseMaxTTLMinutes:    7 * 24 * 60,
 		PublicMailboxLeaseSweepSeconds:     30,
+		DatabaseBackupDir:                  filepath.Join("data", "backups"),
+		DatabaseBackupRetentionDays:        14,
+		DatabaseMessageRetentionDays:       90,
+		DatabaseChangeLogLimit:             5000,
 		UpdateEnabled:                      true,
 		UpdateRepository:                   "xiuxiu56/iCloud-Privacy-Mail-v2",
 	}
@@ -74,6 +82,9 @@ func Load(path string) (Config, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return cfg, nil
 		}
+		return Config{}, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
 		return Config{}, err
 	}
 	var incoming Config
@@ -142,6 +153,22 @@ func Load(path string) (Config, error) {
 	}
 	if incoming.PublicMailboxLeaseSweepSeconds > 0 {
 		cfg.PublicMailboxLeaseSweepSeconds = incoming.PublicMailboxLeaseSweepSeconds
+	}
+	if strings.TrimSpace(incoming.DatabaseBackupDir) != "" {
+		backupDir := strings.TrimSpace(incoming.DatabaseBackupDir)
+		if !filepath.IsAbs(backupDir) {
+			backupDir = filepath.Join(filepath.Dir(path), backupDir)
+		}
+		cfg.DatabaseBackupDir = filepath.Clean(backupDir)
+	}
+	if incoming.DatabaseBackupRetentionDays > 0 {
+		cfg.DatabaseBackupRetentionDays = incoming.DatabaseBackupRetentionDays
+	}
+	if incoming.DatabaseMessageRetentionDays > 0 {
+		cfg.DatabaseMessageRetentionDays = incoming.DatabaseMessageRetentionDays
+	}
+	if incoming.DatabaseChangeLogLimit >= 1000 {
+		cfg.DatabaseChangeLogLimit = incoming.DatabaseChangeLogLimit
 	}
 	if cfg.PublicMailboxLeaseMaxTTLMinutes < cfg.PublicMailboxLeaseTTLMinutes {
 		cfg.PublicMailboxLeaseMaxTTLMinutes = cfg.PublicMailboxLeaseTTLMinutes

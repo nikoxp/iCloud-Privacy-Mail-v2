@@ -1,13 +1,14 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { Apple, CheckCircle2, CloudDownload, Eye, EyeOff, KeyRound, LoaderCircle, Mail, MailPlus, Plus, RefreshCw, Server, ShieldCheck, Trash2, X } from '@lucide/vue'
 import { api } from '../api/client'
 import CardSelect from '../components/CardSelect.vue'
 import { useConfirm } from '../composables/useConfirm'
+import { subscribeRealtime } from '../composables/useRealtime'
 import { useToast } from '../composables/useToast'
 
 const loading = ref(true)
-const busy = ref('')
+const busyActions = ref([])
 const showLogin = ref(false)
 const showIMAP = ref(false)
 const showCreate = ref(false)
@@ -21,6 +22,8 @@ const imap = reactive({ email: '', app_password: '' })
 const create = reactive({ label: '', note: '', channel: 'auto' })
 const { success, error: showError } = useToast()
 const { confirm: confirmAction } = useConfirm()
+let realtimeRefreshTimer
+let realtimeUnsubscribe = () => {}
 const loginFlowOptions = [
   { value: 'apple_account', label: 'Apple Account 新接口', dot: 'bg-violet-500' },
   { value: 'icloud_web', label: 'iCloud Web 旧接口', dot: 'bg-sky-500' },
@@ -39,8 +42,23 @@ function flash(text, isError = false) {
   else success(text)
 }
 
+function isBusy(action) {
+  return busyActions.value.includes(action)
+}
+
+function startBusy(action) {
+  if (!action || isBusy(action)) return false
+  busyActions.value = [...busyActions.value, action]
+  return true
+}
+
+function finishBusy(action) {
+  if (!isBusy(action)) return
+  busyActions.value = busyActions.value.filter((item) => item !== action)
+}
+
 function statusLabel(value) {
-  return ({ active: '正常', need_login: '需要登录', need_2fa: '等待 2FA', no_icloud_plus: '无 iCloud+', rate_limited: '访问受限', failed: '失败' })[value] || value || '未知'
+  return ({ active: '正常', partial: '部分正常', need_login: '需要登录', need_2fa: '等待 2FA', no_icloud_plus: '无 iCloud+', rate_limited: '访问受限', failed: '失败' })[value] || value || '未知'
 }
 
 function stateLabel(kind) {
@@ -70,7 +88,7 @@ function stateStatusClass(state) {
 function accountStatusClass(account) {
   const status = account.icloud_status || account.status
   if (status === 'active') return 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/30 dark:text-emerald-300'
-  if (status === 'need_2fa' || status === 'need_login') return 'bg-amber-50 text-amber-600 dark:bg-amber-950/30 dark:text-amber-300'
+  if (status === 'partial' || status === 'need_2fa' || status === 'need_login') return 'bg-amber-50 text-amber-600 dark:bg-amber-950/30 dark:text-amber-300'
   return 'bg-rose-50 text-rose-600 dark:bg-rose-950/30 dark:text-rose-300'
 }
 
@@ -82,7 +100,7 @@ function openLoginDialog() {
 }
 
 function closeLoginDialog(force = false) {
-  if (!force && (busy.value === 'login' || busy.value === '2fa')) return
+  if (!force && (isBusy('login') || isBusy('2fa'))) return
   showLogin.value = false
   showPassword.value = false
   login.password = ''
@@ -113,8 +131,9 @@ function openCreateDialog() {
   showCreate.value = true
 }
 
-async function load() {
-  loading.value = true
+async function load(options = {}) {
+  const silent = Boolean(options.silent)
+  if (!silent) loading.value = true
   try {
     data.value = await api('/api/apple-accounts')
     if (selected.value) {
@@ -125,8 +144,26 @@ async function load() {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
+}
+
+function scheduleRealtimeRefresh(change) {
+	if (change.resource === 'apple-account' && change.operation === 'updated' && change.payload?.data?.id) {
+		let applied = false
+		data.value.items = (data.value.items || []).map((item) => {
+			if (item.id !== change.payload.data.id) return item
+			applied = true
+			return { ...item, ...change.payload.data }
+		})
+		if (selected.value?.id === change.payload.data.id) {
+			selected.value = { ...selected.value, ...change.payload.data }
+			applied = true
+		}
+		if (applied) return
+	}
+  window.clearTimeout(realtimeRefreshTimer)
+  realtimeRefreshTimer = window.setTimeout(() => load({ silent: true }), 120)
 }
 
 async function deleteAccount(account) {
@@ -138,7 +175,8 @@ async function deleteAccount(account) {
     tone: 'danger',
   })
   if (!confirmed) return
-  busy.value = `delete:${account.id}`
+  const busyKey = `delete:${account.id}`
+  if (!startBusy(busyKey)) return
   try {
     const result = await api(`/api/apple-accounts/${account.id}`, { method: 'DELETE' })
     if (selected.value?.id === account.id) selected.value = null
@@ -148,12 +186,13 @@ async function deleteAccount(account) {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    busy.value = ''
+    finishBusy(busyKey)
   }
 }
 
 async function selectAccount(account) {
-  busy.value = `detail:${account.id}`
+  const busyKey = `detail:${account.id}`
+  if (!startBusy(busyKey)) return
   try {
     const result = await api(`/api/apple-accounts/${account.id}`)
     selected.value = result.account
@@ -161,12 +200,12 @@ async function selectAccount(account) {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    busy.value = ''
+    finishBusy(busyKey)
   }
 }
 
 async function startLogin() {
-  busy.value = 'login'
+  if (!startBusy('login')) return
   flash('正在与 Apple 建立登录态，请稍候…')
   try {
     const result = await api('/api/apple-accounts/login/start', { method: 'POST', body: JSON.stringify(login) })
@@ -181,12 +220,12 @@ async function startLogin() {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    busy.value = ''
+    finishBusy('login')
   }
 }
 
 async function submit2FA() {
-  busy.value = '2fa'
+  if (!startBusy('2fa')) return
   try {
     const body = { pending_id: pending.id, code: pending.code }
     if (pending.phoneNumber.trim()) {
@@ -199,13 +238,13 @@ async function submit2FA() {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    busy.value = ''
+    finishBusy('2fa')
   }
 }
 
 async function checkAccount() {
   if (!selected.value) return
-  busy.value = 'check'
+  if (!startBusy('check')) return
   try {
     const result = await api(`/api/apple-accounts/${selected.value.id}/check`, { method: 'POST' })
     selected.value = result.account
@@ -214,13 +253,13 @@ async function checkAccount() {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    busy.value = ''
+    finishBusy('check')
   }
 }
 
 async function saveIMAP() {
   if (!selected.value) return
-  busy.value = 'imap'
+  if (!startBusy('imap')) return
   try {
     const result = await api(`/api/apple-accounts/${selected.value.id}/imap`, { method: 'POST', body: JSON.stringify(imap) })
     selected.value = result.account
@@ -232,13 +271,13 @@ async function saveIMAP() {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    busy.value = ''
+    finishBusy('imap')
   }
 }
 
 async function createMailbox() {
   if (!selected.value) return
-  busy.value = 'create'
+  if (!startBusy('create')) return
   try {
     const result = await api(`/api/apple-accounts/${selected.value.id}/mailboxes`, { method: 'POST', body: JSON.stringify(create) })
     create.label = ''
@@ -248,13 +287,13 @@ async function createMailbox() {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    busy.value = ''
+    finishBusy('create')
   }
 }
 
 async function syncMailboxes() {
   if (!selected.value) return
-  busy.value = 'sync'
+  if (!startBusy('sync')) return
   try {
     const result = await api(`/api/apple-accounts/${selected.value.id}/mailboxes/sync`, { method: 'POST' })
     showCreate.value = false
@@ -262,96 +301,92 @@ async function syncMailboxes() {
   } catch (err) {
     flash(err.message, true)
   } finally {
-    busy.value = ''
+    finishBusy('sync')
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  realtimeUnsubscribe = subscribeRealtime(['apple-account', 'apple-session'], scheduleRealtimeRefresh)
+})
+
+onBeforeUnmount(() => {
+  window.clearTimeout(realtimeRefreshTimer)
+  realtimeUnsubscribe()
+})
 </script>
 
 <template>
-  <div class="mx-auto flex max-w-7xl flex-col gap-5">
-    <section class="panel flex flex-col gap-4 p-5 lg:flex-row lg:items-center lg:justify-between">
-      <div class="flex min-w-0 flex-1 items-start gap-4">
-        <div class="rounded-xl bg-slate-100 p-3 text-slate-700 dark:bg-slate-700 dark:text-slate-200"><Apple :size="22" /></div>
-        <div class="min-w-0"><h2 class="font-black">Apple 账号工作区</h2><p class="mt-1 max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">集中管理 Apple Account 新接口、iCloud Web 旧接口和 IMAP 取码登录态。</p></div>
-      </div>
-      <div class="flex flex-wrap gap-2 lg:shrink-0 lg:flex-nowrap lg:justify-end">
-        <button class="primary-button whitespace-nowrap" @click="openLoginDialog"><Plus :size="17" />添加 Apple 账号</button>
-        <button class="secondary-button whitespace-nowrap" :disabled="!selected" :title="selected ? `为 ${selected.apple_id} 配置 IMAP` : '请先选择一个 Apple 账号'" @click="openIMAPDialog"><KeyRound :size="17" />IMAP 取码</button>
-        <button class="secondary-button whitespace-nowrap" :disabled="!selected" :title="selected ? `使用 ${selected.apple_id} 创建隐私邮箱` : '请先选择一个 Apple 账号'" @click="openCreateDialog"><MailPlus :size="17" />创建隐私邮箱</button>
+  <div class="apple-account-page">
+    <section class="panel apple-account-workbench">
+      <header class="apple-command-bar">
+        <div class="apple-command-title"><span><Apple :size="16" /></span><div><h2>Apple 账号</h2><p>管理登录态、IMAP 与隐私邮箱通道</p></div></div>
+        <div class="apple-command-actions">
+          <button class="primary-button apple-command-button" @click="openLoginDialog"><Plus :size="14" />添加 Apple 账号</button>
+          <button class="secondary-button apple-command-button" :disabled="!selected" :title="selected ? `为 ${selected.apple_id} 配置 IMAP` : '请先选择一个 Apple 账号'" @click="openIMAPDialog"><KeyRound :size="14" />IMAP 取码</button>
+          <button class="secondary-button apple-command-button" :disabled="!selected" :title="selected ? `使用 ${selected.apple_id} 创建隐私邮箱` : '请先选择一个 Apple 账号'" @click="openCreateDialog"><MailPlus :size="14" />创建隐私邮箱</button>
+        </div>
+      </header>
+
+      <div v-if="loading" class="apple-loading"><LoaderCircle :size="16" class="animate-spin" />正在加载 Apple 账号</div>
+      <div v-else class="apple-account-body">
+        <section class="apple-account-list">
+          <header class="apple-section-heading"><div><h3>账号与登录态</h3><p>选择账号后可在右侧查看各通道状态</p></div><span>{{ data.items?.length || 0 }} 个账号</span></header>
+          <div v-if="!data.items?.length" class="apple-empty"><span><Server :size="20" /></span><strong>还没有 Apple 账号</strong><small>点击“添加 Apple 账号”完成首次协议登录。</small></div>
+          <div v-else class="apple-account-table-viewport">
+            <table class="apple-account-table">
+              <colgroup><col class="apple-col-account" /><col class="apple-col-status" /><col class="apple-col-channel" /><col class="apple-col-action" /></colgroup>
+              <thead><tr><th>Apple 账号</th><th>状态</th><th>登录通道</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-for="account in data.items" :key="account.id" class="apple-account-row" :class="{ 'apple-account-row-selected': selected?.id === account.id }" tabindex="0" :aria-label="`查看 ${account.label || account.apple_id || 'Apple 账号'} 的登录态详情`" @click="selectAccount(account)" @keydown.enter="selectAccount(account)" @keydown.space.prevent="selectAccount(account)">
+                  <td><button type="button" class="apple-account-select" :disabled="isBusy(`delete:${account.id}`) || isBusy(`detail:${account.id}`)" @click.stop="selectAccount(account)"><span class="apple-account-icon"><LoaderCircle v-if="isBusy(`detail:${account.id}`)" :size="14" class="animate-spin" /><Apple v-else :size="14" /></span><span><strong>{{ account.label || account.apple_id || 'Apple 账号' }}</strong><small>{{ account.apple_id || account.id }}</small></span></button></td>
+                  <td><span :class="accountStatusClass(account)" class="apple-status-badge">{{ statusLabel(account.icloud_status || account.status) }}</span></td>
+                  <td><div class="apple-channel-list"><span v-for="state in account.login_states" :key="state.kind" class="apple-channel-pill"><component :is="stateMeta(state.kind).icon" :size="11" /><span>{{ stateLabel(state.kind) }}</span><em :class="stateStatusClass(state)">{{ stateStatusLabel(state) }}</em></span><span v-if="!account.login_states?.length" class="apple-channel-empty">暂无登录态</span></div></td>
+                  <td><button type="button" class="apple-delete-button" :title="`删除 ${account.label || account.apple_id || 'Apple 账号'}`" :aria-label="`删除 ${account.label || account.apple_id || 'Apple 账号'}`" :disabled="isBusy(`delete:${account.id}`)" @click.stop="deleteAccount(account)"><LoaderCircle v-if="isBusy(`delete:${account.id}`)" :size="13" class="animate-spin" /><Trash2 v-else :size="13" /></button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="apple-detail-panel">
+          <div v-if="!selected" class="apple-detail-empty"><span><Apple :size="20" /></span><strong>选择一个 Apple 账号</strong><small>登录态详情和检测结果会显示在这里。</small></div>
+          <template v-else>
+            <header class="apple-detail-heading"><div><span>所选 Apple 账号</span><h3>{{ selected.label || selected.apple_id }}</h3><p>{{ selected.apple_id }}</p></div><button class="secondary-button apple-check-button" :disabled="isBusy('check')" @click="checkAccount"><LoaderCircle v-if="isBusy('check')" :size="13" class="animate-spin" /><RefreshCw v-else :size="13" />{{ isBusy('check') ? '检查中' : '检测登录态' }}</button></header>
+            <div class="apple-state-list">
+              <article v-for="state in selected.login_states" :key="state.kind" class="apple-state-row"><span :class="stateMeta(state.kind).tone" class="apple-state-icon"><component :is="stateMeta(state.kind).icon" :size="14" /></span><span class="apple-state-copy"><strong>{{ stateLabel(state.kind) }}</strong><small>{{ isBusy('check') ? `正在检查 ${stateLabel(state.kind)} 登录态…` : (state.last_status_message || stateMeta(state.kind).description) }}</small></span><span v-if="isBusy('check')" class="apple-state-checking"><LoaderCircle :size="10" class="animate-spin" />检查中</span><span v-else :class="stateStatusClass(state)" class="apple-state-status">{{ stateStatusLabel(state) }}</span></article>
+              <div v-if="!selected.login_states?.length" class="apple-state-empty">该账号还没有已保存的登录态</div>
+            </div>
+          </template>
+        </aside>
       </div>
     </section>
 
-    <div v-if="loading" class="flex min-h-64 items-center justify-center text-slate-400"><LoaderCircle :size="24" class="animate-spin" /></div>
-    <div v-else class="grid items-stretch gap-5 xl:grid-cols-[minmax(0,1fr)_400px]">
-      <section class="panel flex min-h-[520px] flex-col overflow-hidden">
-        <div class="border-b border-slate-100 px-5 py-4 dark:border-slate-700"><h3 class="font-bold">账号与登录态</h3><p class="mt-1 text-xs text-slate-400">共 {{ data.items?.length || 0 }} 个账号</p></div>
-        <div v-if="!data.items?.length" class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center text-slate-400"><Server :size="34" /><div class="font-bold text-slate-600 dark:text-slate-300">还没有 Apple 账号</div><div class="text-sm">点击“添加 Apple 账号”完成首次协议登录。</div></div>
-        <div v-else class="flex-1 space-y-2 p-3">
-          <div v-for="account in data.items" :key="account.id" class="group relative rounded-xl border border-slate-200 transition hover:border-emerald-300 hover:bg-slate-50 dark:border-slate-700 dark:hover:border-emerald-700 dark:hover:bg-slate-700/30" :class="selected?.id === account.id ? 'border-emerald-500 bg-emerald-100 ring-1 ring-inset ring-emerald-300 shadow-sm dark:border-emerald-400 dark:bg-emerald-900/60 dark:ring-emerald-600' : ''">
-            <button type="button" class="flex w-full items-start gap-3 rounded-xl px-4 py-3 pr-14 text-left" :disabled="busy === `delete:${account.id}`" @click="selectAccount(account)">
-              <div class="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-200"><Apple :size="18" /></div>
-              <div class="min-w-0 flex-1">
-                <div class="flex items-center gap-2"><div class="min-w-0 truncate font-bold text-slate-800 dark:text-slate-100">{{ account.label || account.apple_id || 'Apple 账号' }}</div><span :class="accountStatusClass(account)" class="shrink-0 rounded-full px-2 py-1 text-[10px] font-bold">{{ statusLabel(account.icloud_status || account.status) }}</span></div>
-                <div class="mt-1 truncate text-xs text-slate-400">{{ account.apple_id || account.id }}</div>
-                <div class="mt-2 flex flex-wrap gap-1.5">
-                  <span v-for="state in account.login_states" :key="state.kind" class="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
-                    <span :class="stateMeta(state.kind).tone" class="flex h-5 w-5 items-center justify-center rounded-md"><component :is="stateMeta(state.kind).icon" :size="11" /></span>
-                    <span>{{ stateLabel(state.kind) }}</span>
-                    <span :class="stateStatusClass(state)" class="rounded-full px-1.5 py-0.5 text-[9px] font-bold">{{ stateStatusLabel(state) }}</span>
-                  </span>
-                  <span v-if="!account.login_states?.length" class="text-[10px] text-slate-400">暂无登录态</span>
-                </div>
-              </div>
-            </button>
-            <button type="button" class="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-lg border border-rose-200 bg-white/90 text-rose-500 shadow-sm transition hover:border-rose-300 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50 dark:border-rose-900/70 dark:bg-slate-800/90 dark:text-rose-300 dark:hover:bg-rose-950/60" :title="`删除 ${account.label || account.apple_id || 'Apple 账号'}`" :aria-label="`删除 ${account.label || account.apple_id || 'Apple 账号'}`" :disabled="busy === `delete:${account.id}`" @click.stop="deleteAccount(account)"><LoaderCircle v-if="busy === `delete:${account.id}`" :size="15" class="animate-spin" /><Trash2 v-else :size="15" /></button>
-          </div>
-        </div>
-      </section>
-
-      <aside class="h-full min-h-[520px]">
-        <section v-if="!selected" class="panel flex h-full min-h-[520px] flex-col items-center justify-center gap-3 p-6 text-center text-slate-400"><Apple :size="34" /><div class="text-sm">选择一个账号查看和操作登录态</div></section>
-        <section v-else class="panel flex h-full min-h-[520px] flex-col p-5">
-          <div class="flex items-start justify-between gap-3"><div class="min-w-0"><div class="section-title">所选 Apple 账号</div><h3 class="truncate font-black">{{ selected.label || selected.apple_id }}</h3><p class="mt-1 truncate text-xs text-slate-400">{{ selected.apple_id }}</p></div><button class="secondary-button min-w-[92px] px-3 py-2" :disabled="busy === 'check'" @click="checkAccount"><LoaderCircle v-if="busy === 'check'" :size="15" class="animate-spin" /><RefreshCw v-else :size="15" />{{ busy === 'check' ? '检查中' : '检测' }}</button></div>
-          <div class="mt-5 flex-1 space-y-2">
-            <div v-for="state in selected.login_states" :key="state.kind" class="rounded-2xl border border-slate-100 bg-slate-50 p-3.5 dark:border-slate-700 dark:bg-slate-900/40"><div class="flex items-center gap-3"><div :class="stateMeta(state.kind).tone" class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl"><component :is="stateMeta(state.kind).icon" :size="17" /></div><div class="min-w-0 flex-1"><div class="truncate text-xs font-bold">{{ stateLabel(state.kind) }}</div><p class="mt-1 truncate text-[11px] text-slate-400">{{ stateMeta(state.kind).description }}</p></div><span v-if="busy === 'check'" class="inline-flex shrink-0 items-center gap-1 rounded-full bg-sky-50 px-2.5 py-1 text-[10px] font-bold text-sky-600 dark:bg-sky-950/30 dark:text-sky-300"><LoaderCircle :size="11" class="animate-spin" />检查中</span><span v-else :class="stateStatusClass(state)" class="shrink-0 rounded-full px-2.5 py-1 text-[10px] font-bold">{{ stateStatusLabel(state) }}</span></div><p class="mt-3 border-t border-slate-200/70 pt-2 text-xs leading-5 text-slate-400 dark:border-slate-700">{{ busy === 'check' ? `正在检查 ${stateLabel(state.kind)} 登录态…` : (state.last_status_message || '尚未检测') }}</p></div>
-            <div v-if="!selected.login_states?.length" class="rounded-xl bg-slate-50 p-4 text-center text-xs text-slate-400 dark:bg-slate-900/40">该账号还没有已保存的登录态</div>
-          </div>
-        </section>
-      </aside>
-    </div>
-
-    <div v-if="showLogin" class="fixed inset-0 z-50 !m-0 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-[2px]" role="presentation" @click.stop>
-      <section role="dialog" aria-modal="true" aria-labelledby="apple-login-title" class="panel max-h-[calc(100vh-2rem)] w-full max-w-3xl overflow-y-auto p-5 shadow-2xl sm:p-6">
-        <div class="mb-5 flex items-start justify-between gap-4"><div><h3 id="apple-login-title" class="font-black">登录 Apple 账号</h3><p class="mt-1 text-xs leading-5 text-slate-400">登录凭据仅用于本次 Apple 协议请求；保存的是本地登录态。</p></div><button class="icon-button" title="关闭" :disabled="busy === 'login' || busy === '2fa'" @click="closeLoginDialog()"><X :size="18" /></button></div>
-        <form v-if="!pending.id" class="grid gap-4 md:grid-cols-2" @submit.prevent="startLogin">
-          <div class="form-group"><span class="form-label">登录通道</span><CardSelect v-model="login.flow" :options="loginFlowOptions" aria-label="登录通道" /><span class="form-help">新接口用于创建；旧接口支持同步、删除和 Web 收信。</span></div>
-          <div class="form-group"><span class="form-label">两步验证方式</span><CardSelect v-model="login.two_factor_method" :options="twoFactorOptions" aria-label="两步验证方式" /><span class="form-help">优先使用受信任设备弹出的验证码。</span></div>
-          <label class="form-group"><span class="form-label">Apple ID</span><span class="field-wrap"><Mail :size="17" class="field-icon" /><input v-model.trim="login.apple_id" class="field field-leading" autocomplete="username" placeholder="name@example.com" required /></span></label>
-          <label class="form-group"><span class="form-label">Apple ID 密码</span><span class="field-wrap"><KeyRound :size="17" class="field-icon" /><input v-model="login.password" class="field field-leading field-trailing" :type="showPassword ? 'text' : 'password'" autocomplete="current-password" placeholder="输入 Apple ID 密码" required /><button type="button" class="absolute right-3 top-1/2 z-10 -translate-y-1/2 rounded-lg p-1 text-slate-400 transition hover:text-slate-600 dark:hover:text-slate-200" :title="showPassword ? '隐藏密码' : '显示密码'" @click="showPassword = !showPassword"><EyeOff v-if="showPassword" :size="17" /><Eye v-else :size="17" /></button></span></label>
-          <div class="md:col-span-2 flex justify-end"><button class="primary-button" :disabled="busy === 'login'"><LoaderCircle v-if="busy === 'login'" :size="17" class="animate-spin" /><ShieldCheck v-else :size="17" />开始登录</button></div>
+    <div v-if="showLogin" class="mailbox-dialog-backdrop" role="presentation" @click.self="closeLoginDialog()">
+      <section role="dialog" aria-modal="true" aria-labelledby="apple-login-title" class="panel mailbox-operation-dialog apple-login-dialog">
+        <header class="mailbox-dialog-heading"><div><h2 id="apple-login-title"><Apple :size="17" />登录 Apple 账号</h2><p>登录凭据仅用于本次 Apple 协议请求；保存的是本地登录态。</p></div><button class="icon-button" title="关闭" :disabled="isBusy('login') || isBusy('2fa')" @click="closeLoginDialog()"><X :size="16" /></button></header>
+        <form v-if="!pending.id" @submit.prevent="startLogin">
+          <div class="apple-dialog-grid"><div class="form-group"><span class="form-label">登录通道</span><CardSelect v-model="login.flow" :options="loginFlowOptions" aria-label="登录通道" /><span class="form-help">新接口用于创建；旧接口支持同步、删除和 Web 收信。</span></div><div class="form-group"><span class="form-label">两步验证方式</span><CardSelect v-model="login.two_factor_method" :options="twoFactorOptions" aria-label="两步验证方式" /><span class="form-help">优先使用受信任设备弹出的验证码。</span></div><label class="form-group"><span class="form-label">Apple ID</span><span class="field-wrap apple-auth-field"><Mail :size="15" class="field-icon" /><input v-model.trim="login.apple_id" class="field field-leading" autocomplete="username" placeholder="name@example.com" required /></span></label><label class="form-group"><span class="form-label">Apple ID 密码</span><span class="field-wrap apple-auth-field"><KeyRound :size="15" class="field-icon" /><input v-model="login.password" class="field field-leading field-trailing" :type="showPassword ? 'text' : 'password'" autocomplete="current-password" placeholder="输入 Apple ID 密码" required /><button type="button" class="apple-field-toggle" :title="showPassword ? '隐藏密码' : '显示密码'" @click="showPassword = !showPassword"><EyeOff v-if="showPassword" :size="15" /><Eye v-else :size="15" /></button></span></label></div>
+          <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('login')" @click="closeLoginDialog()">取消</button><button class="primary-button" :disabled="isBusy('login')"><LoaderCircle v-if="isBusy('login')" :size="14" class="animate-spin" /><ShieldCheck v-else :size="14" />开始登录</button></footer>
         </form>
-        <form v-else class="grid gap-4 md:grid-cols-2" @submit.prevent="submit2FA">
-          <label class="form-group"><span class="form-label">Apple 验证码</span><input v-model.trim="pending.code" class="field font-mono tracking-[0.3em]" inputmode="numeric" maxlength="8" placeholder="000000" required /><span class="form-help">输入受信任设备或短信收到的验证码。</span></label>
-          <label class="form-group"><span class="form-label">短信号码参数（可选）</span><input v-model.trim="pending.phoneNumber" class="field" placeholder='例如 {"id":1}' /><span class="form-help">只有短信流程要求选择号码时才填写。</span></label>
-          <div class="md:col-span-2 flex justify-end"><button class="primary-button" :disabled="busy === '2fa'"><LoaderCircle v-if="busy === '2fa'" :size="17" class="animate-spin" /><CheckCircle2 v-else :size="17" />提交验证码</button></div>
-        </form>
+        <form v-else @submit.prevent="submit2FA"><div class="apple-dialog-grid"><label class="form-group"><span class="form-label">Apple 验证码</span><input v-model.trim="pending.code" class="field font-mono tracking-[0.3em]" inputmode="numeric" maxlength="8" placeholder="000000" required /><span class="form-help">输入受信任设备或短信收到的验证码。</span></label><label class="form-group"><span class="form-label">短信号码参数（可选）</span><input v-model.trim="pending.phoneNumber" class="field" placeholder='例如 {"id":1}' /><span class="form-help">只有短信流程要求选择号码时才填写。</span></label></div><footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('2fa')" @click="closeLoginDialog()">取消</button><button class="primary-button" :disabled="isBusy('2fa')"><LoaderCircle v-if="isBusy('2fa')" :size="14" class="animate-spin" /><CheckCircle2 v-else :size="14" />提交验证码</button></footer></form>
       </section>
     </div>
 
-    <div v-if="showIMAP" class="fixed inset-0 z-50 !m-0 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-[2px]" role="presentation" @click.stop>
-      <section role="dialog" aria-modal="true" aria-labelledby="imap-title" class="panel max-h-[calc(100vh-2rem)] w-full max-w-lg overflow-y-auto p-5 shadow-2xl sm:p-6">
-        <div class="mb-5 flex items-start justify-between gap-4"><div><h3 id="imap-title" class="flex items-center gap-2 font-black"><KeyRound :size="18" />IMAP 取码</h3><p class="mt-1 text-xs leading-5 text-slate-400">当前账号：{{ selected?.label || selected?.apple_id }}</p></div><button class="icon-button" title="关闭" :disabled="busy === 'imap'" @click="showIMAP = false"><X :size="18" /></button></div>
-        <form class="space-y-4" @submit.prevent="saveIMAP"><label class="form-group"><span class="form-label">iCloud 邮箱</span><input v-model.trim="imap.email" class="field" type="email" placeholder="name@icloud.com" required /></label><label class="form-group"><span class="form-label">App 专用密码</span><span class="field-wrap"><KeyRound :size="17" class="field-icon" /><input v-model="imap.app_password" class="field field-leading field-trailing" :type="showIMAPPassword ? 'text' : 'password'" placeholder="xxxx-xxxx-xxxx-xxxx" required /><button type="button" class="absolute right-3 top-1/2 z-10 -translate-y-1/2 rounded-lg p-1 text-slate-400 transition hover:text-slate-600 dark:hover:text-slate-200" :title="showIMAPPassword ? '隐藏 App 专用密码' : '显示 App 专用密码'" @click="showIMAPPassword = !showIMAPPassword"><EyeOff v-if="showIMAPPassword" :size="17" /><Eye v-else :size="17" /></button></span><span class="form-help">保存前会连接 imap.mail.me.com 验证。</span></label><button class="secondary-button w-full" :disabled="busy === 'imap'"><LoaderCircle v-if="busy === 'imap'" :size="16" class="animate-spin" /><ShieldCheck v-else :size="16" />验证并保存</button></form>
-      </section>
+    <div v-if="showIMAP" class="mailbox-dialog-backdrop" role="presentation" @click.self="showIMAP = false">
+      <form role="dialog" aria-modal="true" aria-labelledby="imap-title" class="panel mailbox-operation-dialog apple-form-dialog" @submit.prevent="saveIMAP">
+        <header class="mailbox-dialog-heading"><div><h2 id="imap-title"><KeyRound :size="17" />IMAP 取码</h2><p>当前账号：{{ selected?.label || selected?.apple_id }}</p></div><button type="button" class="icon-button" title="关闭" :disabled="isBusy('imap')" @click="showIMAP = false"><X :size="16" /></button></header>
+        <div class="apple-dialog-fields"><label class="form-group"><span class="form-label">iCloud 邮箱</span><input v-model.trim="imap.email" class="field" type="email" placeholder="name@icloud.com" required /></label><label class="form-group"><span class="form-label">App 专用密码</span><span class="field-wrap apple-auth-field"><KeyRound :size="15" class="field-icon" /><input v-model="imap.app_password" class="field field-leading field-trailing" :type="showIMAPPassword ? 'text' : 'password'" placeholder="xxxx-xxxx-xxxx-xxxx" required /><button type="button" class="apple-field-toggle" :title="showIMAPPassword ? '隐藏 App 专用密码' : '显示 App 专用密码'" @click="showIMAPPassword = !showIMAPPassword"><EyeOff v-if="showIMAPPassword" :size="15" /><Eye v-else :size="15" /></button></span><span class="form-help">保存前会连接 imap.mail.me.com 验证。</span></label></div>
+        <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('imap')" @click="showIMAP = false">取消</button><button class="primary-button" :disabled="isBusy('imap')"><LoaderCircle v-if="isBusy('imap')" :size="14" class="animate-spin" /><ShieldCheck v-else :size="14" />验证并保存</button></footer>
+      </form>
     </div>
 
-    <div v-if="showCreate" class="fixed inset-0 z-50 !m-0 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-[2px]" role="presentation" @click.stop>
-      <section role="dialog" aria-modal="true" aria-labelledby="create-mailbox-title" class="panel max-h-[calc(100vh-2rem)] w-full max-w-lg overflow-y-auto p-5 shadow-2xl sm:p-6">
-        <div class="mb-5 flex items-start justify-between gap-4"><div><h3 id="create-mailbox-title" class="flex items-center gap-2 font-black"><MailPlus :size="18" />创建隐私邮箱</h3><p class="mt-1 text-xs leading-5 text-slate-400">当前账号：{{ selected?.label || selected?.apple_id }}</p></div><button class="icon-button" title="关闭" :disabled="busy === 'create' || busy === 'sync'" @click="showCreate = false"><X :size="18" /></button></div>
-        <form class="space-y-4" @submit.prevent="createMailbox"><div class="form-group"><span class="form-label">创建通道</span><CardSelect v-model="create.channel" :options="createChannelOptions" aria-label="创建通道" /></div><label class="form-group"><span class="form-label">标签前缀</span><input v-model.trim="create.label" class="field" placeholder="可选" /><span class="form-help">留空默认使用 x，并根据已有最大编号生成 x_1、x_2、x_3。</span></label><label class="form-group"><span class="form-label">备注</span><textarea v-model.trim="create.note" class="field min-h-20 resize-y" placeholder="可选备注" /></label><div class="grid grid-cols-2 gap-2"><button class="primary-button" :disabled="busy === 'create'"><LoaderCircle v-if="busy === 'create'" :size="16" class="animate-spin" /><Plus v-else :size="16" />创建</button><button class="secondary-button" type="button" :disabled="busy === 'sync'" @click="syncMailboxes"><CloudDownload :size="16" :class="busy === 'sync' ? 'animate-pulse' : ''" />同步已有</button></div></form>
-      </section>
+    <div v-if="showCreate" class="mailbox-dialog-backdrop" role="presentation" @click.self="showCreate = false">
+      <form role="dialog" aria-modal="true" aria-labelledby="create-mailbox-title" class="panel mailbox-operation-dialog apple-create-dialog" @submit.prevent="createMailbox">
+        <header class="mailbox-dialog-heading"><div><h2 id="create-mailbox-title"><MailPlus :size="17" />创建隐私邮箱</h2><p>当前账号：{{ selected?.label || selected?.apple_id }}</p></div><button type="button" class="icon-button" title="关闭" :disabled="isBusy('create') || isBusy('sync')" @click="showCreate = false"><X :size="16" /></button></header>
+        <div class="apple-dialog-fields"><div class="form-group"><span class="form-label">创建通道</span><CardSelect v-model="create.channel" :options="createChannelOptions" aria-label="创建通道" /></div><div class="apple-create-meta"><label class="form-group"><span class="form-label">标签前缀</span><input v-model.trim="create.label" class="field" placeholder="可选，默认 x" /></label><label class="form-group"><span class="form-label">备注</span><input v-model.trim="create.note" class="field" placeholder="可选备注" /></label></div><span class="form-help">标签留空时默认使用 x，并自动生成连续编号。</span></div>
+        <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('sync')" @click="syncMailboxes"><LoaderCircle v-if="isBusy('sync')" :size="14" class="animate-spin" /><CloudDownload v-else :size="14" />{{ isBusy('sync') ? '同步中' : '同步已有' }}</button><button class="primary-button" :disabled="isBusy('create')"><LoaderCircle v-if="isBusy('create')" :size="14" class="animate-spin" /><Plus v-else :size="14" />{{ isBusy('create') ? '创建中' : '创建邮箱' }}</button></footer>
+      </form>
     </div>
   </div>
 </template>

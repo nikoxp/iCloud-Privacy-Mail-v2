@@ -73,6 +73,7 @@ func New(cfg config.Config, state *store.Store, logger *slog.Logger) *Server {
 		mux:              http.NewServeMux(),
 		keepAliveTargets: make(map[string]appleKeepAliveTarget),
 	}
+	state.SetChangeLogLimit(cfg.DatabaseChangeLogLimit)
 	s.scheduler = scheduler.NewService(state, s.mailbox)
 	s.watcher = mailwatcher.NewService(cfg, state, s.mailbox, logger)
 	s.keepAliveState = s.apple.KeepAliveState
@@ -111,6 +112,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/apple-accounts/{id}/imap", s.protected(s.handleAppleAccountSaveIMAP))
 	s.mux.HandleFunc("POST /api/apple-accounts/{id}/mailboxes", s.protected(s.handleCreatePrivacyMailbox))
 	s.mux.HandleFunc("POST /api/apple-accounts/{id}/mailboxes/sync", s.protected(s.handleSyncPrivacyMailboxes))
+	s.mux.HandleFunc("GET /api/apple-mail/cleanup/status", s.protected(s.handleAppleMailCleanupStatus))
+	s.mux.HandleFunc("POST /api/apple-mail/cleanup", s.protected(s.handleAppleMailCleanupStart))
+	s.mux.HandleFunc("POST /api/apple-mail/cleanup/cancel", s.protected(s.handleAppleMailCleanupCancel))
 	s.mux.HandleFunc("GET /api/mailboxes", s.protected(s.handleMailboxes))
 	s.mux.HandleFunc("POST /api/mailboxes", s.protected(s.handleImportMailbox))
 	s.mux.HandleFunc("POST /api/mailboxes/remote-clean", s.protected(s.handleMailboxesRemoteClean))
@@ -128,6 +132,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/create-settings", s.protected(s.handleCreateSettings))
 	s.mux.HandleFunc("PUT /api/create-settings", s.protected(s.handleSaveCreateSettings))
 	s.mux.HandleFunc("GET /api/events", s.protected(s.handleEvents))
+	s.mux.HandleFunc("GET /api/realtime", s.protected(s.handleRealtime))
+	s.mux.HandleFunc("GET /api/database/status", s.protected(s.handleDatabaseStatus))
+	s.mux.HandleFunc("POST /api/database/backup", s.protected(s.handleDatabaseBackup))
+	s.mux.HandleFunc("POST /api/database/check", s.protected(s.handleDatabaseCheck))
+	s.mux.HandleFunc("POST /api/database/optimize", s.protected(s.handleDatabaseOptimize))
 	s.mux.HandleFunc("POST /api/events/clear", s.protected(s.handleClearEvents))
 	s.mux.HandleFunc("GET /api/runtime/export", s.protected(s.handleExportRuntime))
 	s.mux.HandleFunc("GET /api/runtime/export-mailbox-apis", s.protected(s.handleExportMailboxAPIs))
@@ -148,7 +157,9 @@ func (s *Server) StartBackground(ctx context.Context) {
 		ctx = context.Background()
 	}
 	s.runtimeCtx = ctx
+	s.scheduler.Resume(ctx)
 	go s.runMailboxLeaseReaper(ctx)
+	go s.runDatabaseMaintenance(ctx)
 	if s.cfg.AppleAccountKeepAliveEnabled {
 		go s.runAppleKeepAlive(ctx)
 	}
@@ -608,7 +619,7 @@ func (s *Server) handleCreatePrivacyMailbox(w http.ResponseWriter, r *http.Reque
 	accountID := r.PathValue("id")
 	mailbox, err := s.mailbox.Create(r.Context(), accountID, body.Label, body.Note, body.Channel)
 	if err != nil {
-		s.scheduler.RecordManualFailure(accountID, err)
+		s.scheduler.RecordManualFailure(accountID, body.Label, err)
 		writeServiceError(w, err)
 		return
 	}
@@ -632,7 +643,7 @@ func (s *Server) handleSyncPrivacyMailboxes(w http.ResponseWriter, r *http.Reque
 func (s *Server) handleMailboxes(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	page := parsePositiveInt(query.Get("page"), 1)
-	pageSize := parsePositiveInt(query.Get("page_size"), s.store.Settings().MailboxPageSize)
+	pageSize := parsePositiveInt(query.Get("page_size"), 0)
 	result := s.store.Mailboxes(query.Get("q"), query.Get("status"), query.Get("account_id"), page, pageSize)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": result})
 }
@@ -716,6 +727,49 @@ func (s *Server) handleMailboxRemoteClean(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"cleanup": result}})
+}
+
+func (s *Server) handleAppleMailCleanupStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"job": s.mailbox.AppleMailCleanupStatus()}})
+}
+
+func (s *Server) handleAppleMailCleanupStart(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AccountIDs []string `json:"account_ids"`
+		Scope      string   `json:"scope"`
+		Strategy   string   `json:"strategy"`
+		PurgeLocal *bool    `json:"purge_local"`
+	}
+	if r.ContentLength != 0 {
+		if err := decodeJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+			return
+		}
+	}
+	purgeLocal := true
+	if body.PurgeLocal != nil {
+		purgeLocal = *body.PurgeLocal
+	}
+	job, err := s.mailbox.StartAppleMailCleanup(s.runtimeCtx, mailboxservice.AppleMailCleanupRequest{
+		AccountIDs: body.AccountIDs,
+		Scope:      body.Scope,
+		Strategy:   body.Strategy,
+		PurgeLocal: purgeLocal,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "正在运行") {
+			writeError(w, http.StatusConflict, "apple_mail_cleanup_running", err.Error())
+			return
+		}
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"success": true, "data": map[string]any{"job": job}})
+}
+
+func (s *Server) handleAppleMailCleanupCancel(w http.ResponseWriter, _ *http.Request) {
+	job := s.mailbox.CancelAppleMailCleanup("已手动取消全部 Apple 邮件清理任务")
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"job": job}})
 }
 
 func (s *Server) handleMailboxesRemoteClean(w http.ResponseWriter, r *http.Request) {
@@ -844,6 +898,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
 		"data_path":  s.store.Path(),
 		"local_only": true,
 		"runtime": map[string]any{
+			"database_status":                  s.store.DatabaseStatus(),
+			"database_backup_dir":              s.cfg.DatabaseBackupDir,
+			"database_message_retention_days":  s.cfg.DatabaseMessageRetentionDays,
 			"mail_watcher_available":           s.cfg.MailWatcherEnabled,
 			"mail_watcher_poll_ms":             s.cfg.MailWatcherPollMS,
 			"mail_watcher_fetch_limit":         s.cfg.MailWatcherFetchLimit,

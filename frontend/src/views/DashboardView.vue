@@ -1,8 +1,9 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Apple, ArrowRight, Boxes, CheckCircle2, CircleAlert, Inbox, LoaderCircle, MailCheck, MessageSquareText, ShieldCheck, Timer, Trash2 } from '@lucide/vue'
 import { api } from '../api/client'
 import { useConfirm } from '../composables/useConfirm'
+import { subscribeRealtime } from '../composables/useRealtime'
 import { useToast } from '../composables/useToast'
 
 const loading = ref(true)
@@ -11,9 +12,16 @@ const clearing = ref(false)
 const dashboard = ref({ events: [] })
 const runtimeTasks = ref([])
 const currentTime = ref(Date.now())
+const eventsViewport = ref(null)
+const workspaceHeight = ref(576)
 let countdownTimer
 let runtimeRefreshTimer
 let eventRefreshTimer
+let realtimeRefreshTimer
+let realtimeUnsubscribe = () => {}
+let workspaceResizeTimer
+let workspaceLayoutObserver
+const pendingRealtimeResources = new Set()
 let eventRefreshing = false
 const { error: showError, success: showSuccess } = useToast()
 const { confirm: confirmAction } = useConfirm()
@@ -89,6 +97,64 @@ async function refreshEvents() {
   }
 }
 
+async function refreshDashboard() {
+  try {
+    dashboard.value = await api('/api/dashboard')
+  } catch {
+    return
+  }
+}
+
+function scheduleRealtimeRefresh(change) {
+	if (change.resource === 'event' && change.operation === 'created' && change.payload?.data) {
+		dashboard.value.events = [change.payload.data, ...(dashboard.value.events || []).filter((item) => item.id !== change.payload.data.id)].slice(0, 30)
+		return
+	}
+	if (change.resource === 'mailbox' && change.operation === 'batch-updated') {
+		const created = Number(change.payload?.created_message_count || 0)
+		if (created > 0) dashboard.value.message_count = Number(dashboard.value.message_count || 0) + created
+		return
+	}
+  pendingRealtimeResources.add(change.resource)
+  window.clearTimeout(realtimeRefreshTimer)
+  realtimeRefreshTimer = window.setTimeout(() => {
+    const resources = new Set(pendingRealtimeResources)
+    pendingRealtimeResources.clear()
+    if (resources.has('scheduler')) void refreshRuntimeTasks()
+    if (resources.has('event')) void refreshEvents()
+    if (['mailbox', 'message', 'apple-account'].some((resource) => resources.has(resource))) void refreshDashboard()
+  }, 120)
+}
+
+function calculateWorkspaceHeight() {
+  const element = eventsViewport.value
+  if (!element || window.matchMedia('(max-width: 860px)').matches) return
+
+  const scrollContainer = element.closest('.page-scroll')
+  const scrollTop = scrollContainer?.scrollTop || 0
+  const viewportTop = element.getBoundingClientRect().top + scrollTop
+  const scrollBottom = scrollContainer?.getBoundingClientRect().bottom || window.innerHeight
+  const scrollStyle = scrollContainer ? window.getComputedStyle(scrollContainer) : null
+  const bottomPadding = Number.parseFloat(scrollStyle?.paddingBottom || '0') || 0
+  const panelHeaderHeight = element.previousElementSibling?.getBoundingClientRect().height || 54
+  const tableHeaderHeight = element.querySelector('thead')?.getBoundingClientRect().height || 36
+  const dataRow = element.querySelector('tbody tr:not(.dashboard-events-empty-row)')
+  const rowHeight = dataRow?.getBoundingClientRect().height || 43
+  const tableWidth = element.querySelector('table')?.scrollWidth || 0
+  const hasHorizontalScrollbar = tableWidth > element.clientWidth + 1
+  const reservedHeight = (hasHorizontalScrollbar ? 8 : 0) + 1
+  const availableHeight = scrollBottom - viewportTop - bottomPadding - 2
+  const visibleRows = Math.max(5, Math.floor((availableHeight - tableHeaderHeight - reservedHeight) / rowHeight))
+  const nextHeight = Math.floor(panelHeaderHeight + tableHeaderHeight + visibleRows * rowHeight + reservedHeight)
+
+  if (nextHeight !== workspaceHeight.value) workspaceHeight.value = nextHeight
+}
+
+function scheduleWorkspaceHeight() {
+  window.clearTimeout(workspaceResizeTimer)
+  workspaceResizeTimer = window.setTimeout(calculateWorkspaceHeight, 80)
+}
+
 function eventTone(level) {
   if (level === 'error') return 'bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300'
   if (level === 'warning') return 'bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300'
@@ -133,57 +199,71 @@ onMounted(async () => {
     loading.value = false
   }
   countdownTimer = window.setInterval(() => { currentTime.value = Date.now() }, 1000)
-  runtimeRefreshTimer = window.setInterval(refreshRuntimeTasks, 10000)
-  eventRefreshTimer = window.setInterval(refreshEvents, 2000)
+  realtimeUnsubscribe = subscribeRealtime(['scheduler', 'event', 'mailbox', 'message', 'apple-account'], scheduleRealtimeRefresh)
+  runtimeRefreshTimer = window.setInterval(refreshRuntimeTasks, 30000)
+  eventRefreshTimer = window.setInterval(refreshEvents, 30000)
+  await nextTick()
+  scheduleWorkspaceHeight()
+  workspaceLayoutObserver = new ResizeObserver(scheduleWorkspaceHeight)
+  const scrollContainer = eventsViewport.value?.closest('.page-scroll')
+  if (scrollContainer) workspaceLayoutObserver.observe(scrollContainer)
+  window.addEventListener('resize', scheduleWorkspaceHeight)
+})
+
+watch([loading, () => dashboard.value.events?.length], async () => {
+  await nextTick()
+  scheduleWorkspaceHeight()
 })
 
 onBeforeUnmount(() => {
   window.clearInterval(countdownTimer)
   window.clearInterval(runtimeRefreshTimer)
   window.clearInterval(eventRefreshTimer)
+  window.clearTimeout(realtimeRefreshTimer)
+  window.clearTimeout(workspaceResizeTimer)
+  window.removeEventListener('resize', scheduleWorkspaceHeight)
+  workspaceLayoutObserver?.disconnect()
+  pendingRealtimeResources.clear()
+  realtimeUnsubscribe()
 })
 </script>
 
 <template>
-  <div class="mx-auto max-w-7xl space-y-6">
-    <div v-if="loading" class="flex min-h-72 items-center justify-center text-slate-400"><LoaderCircle class="animate-spin" :size="24" /></div>
-    <div v-else-if="loadFailed" class="panel border-rose-200 p-5 text-rose-600 dark:border-rose-900">控制台数据加载失败，请稍后刷新。</div>
+  <div class="dashboard-page">
+    <div v-if="loading" class="dashboard-loading"><LoaderCircle class="animate-spin" :size="18" />正在加载控制台</div>
+    <div v-else-if="loadFailed" class="panel dashboard-load-error">控制台数据加载失败，请稍后刷新。</div>
     <template v-else>
-      <div class="grid gap-4 sm:grid-cols-3">
-        <article v-for="card in cards" :key="card.label" class="panel p-5">
-          <div class="flex items-start justify-between"><div><div class="text-sm font-medium text-slate-400">{{ card.label }}</div><div class="mt-2 text-3xl font-black text-slate-900 dark:text-white">{{ card.value }}</div></div><div :class="card.tone" class="rounded-xl p-2.5"><component :is="card.icon" :size="20" /></div></div>
-          <div class="mt-3 text-xs text-slate-400">{{ card.detail }}</div>
+      <div class="dashboard-stat-grid">
+        <article v-for="card in cards" :key="card.label" class="panel dashboard-stat-card">
+          <span :class="card.tone" class="dashboard-stat-icon"><component :is="card.icon" :size="17" /></span>
+          <span class="dashboard-stat-copy"><span>{{ card.label }}</span><strong>{{ card.value }}</strong><small>{{ card.detail }}</small></span>
         </article>
       </div>
 
-      <div class="grid items-stretch gap-6 xl:grid-cols-[1fr_330px]">
-        <section class="panel h-full overflow-hidden">
-          <div class="flex items-center justify-between border-b border-slate-100 px-5 py-4 dark:border-slate-700"><div><h2 class="font-bold text-slate-800 dark:text-slate-100">运行记录</h2><p class="mt-0.5 text-xs text-slate-400">最近产生的系统事件</p></div><div class="flex items-center gap-1"><button class="icon-button" title="清空运行记录" :disabled="clearing || !dashboard.events?.length" @click="clearEvents"><LoaderCircle v-if="clearing" :size="17" class="animate-spin" /><Trash2 v-else :size="17" /></button><Inbox :size="19" class="text-slate-400" /></div></div>
-          <div v-if="!dashboard.events?.length" class="flex h-[486.5px] flex-col items-center justify-center gap-3 text-slate-400"><MailCheck :size="35" class="text-emerald-400" /><div class="text-sm">暂无运行事件</div></div>
-          <div v-else class="h-[486.5px] overflow-y-auto">
-            <div v-for="event in dashboard.events" :key="event.id" class="flex min-h-[69.5px] items-center gap-3 border-b border-slate-100 px-5 py-3.5 dark:border-slate-700/70"><div :class="eventTone(event.level)" class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg"><CircleAlert v-if="event.level === 'error'" :size="14" /><CheckCircle2 v-else :size="14" /></div><div class="min-w-0 flex-1"><div class="break-words text-sm text-slate-700 dark:text-slate-200">{{ event.message }}</div><div class="mt-1 flex gap-2 text-[11px] text-slate-400"><span>{{ event.category }}</span><span>·</span><span>{{ formatTime(event.created_at) }}</span></div></div></div>
+      <div class="dashboard-workspace" :style="{ '--dashboard-workspace-height': `${workspaceHeight}px` }">
+        <section class="panel dashboard-events-panel">
+          <header class="dashboard-section-heading"><div><h2>运行记录</h2><p>最近产生的系统事件</p></div><div><span>{{ dashboard.events?.length || 0 }} 条记录</span><button class="icon-button dashboard-clear-button" title="清空运行记录" :disabled="clearing || !dashboard.events?.length" @click="clearEvents"><LoaderCircle v-if="clearing" :size="14" class="animate-spin" /><Trash2 v-else :size="14" /></button></div></header>
+          <div ref="eventsViewport" class="dashboard-events-viewport">
+            <table class="dashboard-events-table" :class="{ 'dashboard-events-table-empty': !dashboard.events?.length }">
+              <colgroup><col class="dashboard-event-column" /><col class="dashboard-event-column" /><col class="dashboard-event-column" /></colgroup>
+              <thead><tr><th>事件</th><th>类型</th><th>时间</th></tr></thead>
+              <tbody>
+                <tr v-for="event in dashboard.events" :key="event.id">
+                  <td><span class="dashboard-event-entry"><span :class="eventTone(event.level)" class="dashboard-event-icon"><CircleAlert v-if="event.level === 'error'" :size="12" /><CheckCircle2 v-else :size="12" /></span><span class="dashboard-event-message" :title="event.message">{{ event.message }}</span></span></td>
+                  <td><span class="dashboard-event-category">{{ event.category }}</span></td>
+                  <td><time>{{ formatTime(event.created_at) }}</time></td>
+                </tr>
+                <tr v-if="!dashboard.events?.length" class="dashboard-events-empty-row"><td colspan="3" class="dashboard-events-empty"><span><MailCheck :size="20" /></span><strong>暂无运行事件</strong><small>系统事件产生后会显示在这里。</small></td></tr>
+              </tbody>
+            </table>
           </div>
         </section>
 
-        <aside class="h-full">
-          <section class="panel flex h-full flex-col overflow-hidden">
-            <div class="bg-gradient-to-br from-emerald-500 to-teal-700 p-5 text-white">
-              <div class="text-xs font-bold tracking-[0.18em] text-emerald-100">运行状态</div>
-              <h2 class="mt-2 text-xl font-black">核心服务</h2>
-              <p class="mt-2 text-xs leading-5 text-emerald-50/90">集中查看后台监听、登录态保活、定时创建和公共 API。</p>
-            </div>
-            <div class="flex min-h-0 flex-1 flex-col p-4">
-              <div v-if="operationalTasks.length" class="divide-y divide-slate-100 dark:divide-slate-700/70">
-                <div v-for="task in operationalTasks" :key="task.id" class="flex items-center gap-3 py-3.5">
-                  <span :class="taskIconClass(task.status)" class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl"><component :is="taskIcon(task)" :size="17" /></span>
-                  <span class="min-w-0 flex-1"><strong class="block truncate text-sm text-slate-700 dark:text-slate-200">{{ task.name }}</strong><small class="mt-0.5 block truncate text-[10px] text-slate-400" :title="taskDescription(task)">{{ taskDescription(task) }}</small></span>
-                  <span :class="taskStatusClass(task.status)" class="shrink-0 rounded-full px-2 py-1 text-[10px] font-bold">{{ taskStatusText(task.status) }}</span>
-                </div>
-              </div>
-              <div v-else class="flex flex-1 items-center justify-center text-xs text-slate-400">暂无运行状态</div>
-              <RouterLink to="/tasks" class="secondary-button mt-auto w-full justify-center">创建隐私邮箱 <ArrowRight :size="15" /></RouterLink>
-            </div>
-          </section>
+        <aside class="panel dashboard-services-panel">
+          <header class="dashboard-section-heading"><div><h2>核心服务</h2><p>后台任务实时状态</p></div><Inbox :size="16" /></header>
+          <div v-if="operationalTasks.length" class="dashboard-service-list"><article v-for="task in operationalTasks" :key="task.id" class="dashboard-service-row"><span :class="taskIconClass(task.status)" class="dashboard-service-icon"><component :is="taskIcon(task)" :size="14" /></span><span class="dashboard-service-copy"><strong>{{ task.name }}</strong><small :title="taskDescription(task)">{{ taskDescription(task) }}</small></span><span :class="taskStatusClass(task.status)" class="dashboard-service-status">{{ taskStatusText(task.status) }}</span></article></div>
+          <div v-else class="dashboard-service-empty">暂无运行状态</div>
+          <footer><RouterLink to="/tasks" class="secondary-button dashboard-task-link">创建隐私邮箱 <ArrowRight :size="13" /></RouterLink></footer>
         </aside>
       </div>
     </template>

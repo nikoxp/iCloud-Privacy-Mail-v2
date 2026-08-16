@@ -1,13 +1,16 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { Database, Download, FileJson, Globe2, KeyRound, Mail, ShieldAlert } from '@lucide/vue'
 import { api } from '../api/client'
+import { subscribeRealtime } from '../composables/useRealtime'
 import { useToast } from '../composables/useToast'
 
 const runtime = ref({})
 const settings = ref({})
 const dataPath = ref('')
 const { error: showError } = useToast()
+let realtimeRefreshTimer
+let realtimeUnsubscribe = () => {}
 
 const publicAPIKeyReady = computed(() => Boolean(String(settings.value.public_api_key || '').trim() || runtime.value.config_api_key_configured))
 const publicAPIKeySource = computed(() => {
@@ -34,33 +37,33 @@ async function load() {
   }
 }
 
-onMounted(load)
+function scheduleRealtimeRefresh() {
+  window.clearTimeout(realtimeRefreshTimer)
+  realtimeRefreshTimer = window.setTimeout(load, 120)
+}
+
+onMounted(() => {
+  load()
+  realtimeUnsubscribe = subscribeRealtime('settings', scheduleRealtimeRefresh)
+})
+
+onBeforeUnmount(() => {
+  window.clearTimeout(realtimeRefreshTimer)
+  realtimeUnsubscribe()
+})
 </script>
 
 <template>
-  <div class="mx-auto max-w-6xl space-y-5">
-    <section class="panel overflow-hidden">
-      <div class="flex flex-col gap-3 border-b border-slate-100 px-5 py-5 dark:border-slate-700 sm:flex-row sm:items-center sm:justify-between sm:px-6">
-        <div><h2 class="text-lg font-black">选择导出内容</h2><p class="mt-1 text-sm leading-6 text-slate-400">根据用途下载完整备份、邮件数据、邮箱地址或取码 API。</p></div>
-        <span class="inline-flex self-start items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1.5 text-xs font-bold text-amber-700 dark:bg-amber-950/60 dark:text-amber-300"><ShieldAlert :size="14" />包含敏感本地数据</span>
-      </div>
-
-      <div class="grid gap-4 p-5 sm:grid-cols-2 sm:p-6">
-        <a v-for="item in exportItems" :key="item.title" :href="item.href" download class="group flex min-h-36 items-start gap-4 rounded-2xl border border-slate-200 bg-slate-50 p-5 transition hover:-translate-y-0.5 hover:border-emerald-300 hover:bg-emerald-50/60 hover:shadow-lg hover:shadow-emerald-500/5 dark:border-slate-700 dark:bg-slate-800/70 dark:hover:border-emerald-700 dark:hover:bg-emerald-950/20">
-          <span :class="item.tone" class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl"><component :is="item.icon" :size="20" /></span>
-          <span class="min-w-0 flex-1"><span class="flex items-center justify-between gap-3"><strong class="text-sm text-slate-800 dark:text-slate-100">{{ item.title }}</strong><span class="rounded-md bg-white px-2 py-0.5 font-mono text-[10px] font-black text-slate-400 shadow-sm dark:bg-slate-900">{{ item.format }}</span></span><small class="mt-2 block text-xs leading-5 text-slate-400">{{ item.description }}</small><span class="mt-4 inline-flex items-center gap-1.5 text-xs font-bold text-emerald-600 dark:text-emerald-300"><Download :size="14" />下载文件</span></span>
-        </a>
-      </div>
+  <div class="exports-page">
+    <section class="panel exports-workbench">
+      <header class="exports-command-bar"><div><span><Download :size="16" /></span><div><h2>本地导出</h2><p>下载运行数据、邮件、邮箱地址或取码 API</p></div></div><span class="exports-warning"><ShieldAlert :size="12" />包含敏感本地数据</span></header>
+      <div class="exports-item-grid"><a v-for="item in exportItems" :key="item.title" :href="item.href" download class="exports-item"><span :class="item.tone" class="exports-item-icon"><component :is="item.icon" :size="16" /></span><span class="exports-item-copy"><span><strong>{{ item.title }}</strong><em>{{ item.format }}</em></span><small>{{ item.description }}</small></span><span class="exports-download"><Download :size="13" />下载</span></a></div>
     </section>
 
-    <section class="panel p-5 sm:p-6">
-      <h3 class="section-title flex items-center gap-2"><Globe2 :size="16" />导出环境</h3>
-      <div class="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-3">
-        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800"><span class="text-slate-400">状态文件</span><strong class="mt-1.5 block truncate font-mono text-slate-700 dark:text-slate-200" :title="dataPath">{{ dataPath || '使用当前运行状态文件' }}</strong></div>
-        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800"><span class="text-slate-400">公共基础地址</span><strong class="mt-1.5 block truncate text-slate-700 dark:text-slate-200">{{ runtime.public_base_url || '按当前访问地址生成' }}</strong></div>
-        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800 sm:col-span-2 lg:col-span-1"><span class="text-slate-400">全局 API Key</span><strong :class="publicAPIKeyReady ? 'text-emerald-600 dark:text-emerald-300' : 'text-amber-600 dark:text-amber-300'" class="mt-1.5 block">{{ publicAPIKeyReady ? `已配置（${publicAPIKeySource}）` : '尚未设置' }}</strong></div>
-      </div>
-      <p class="mt-4 text-xs leading-5 text-slate-400">运行数据导出包含 Apple 登录态、Cookie 和 App 专用密码等内容，请将下载文件保存在可信位置。</p>
+    <section class="panel exports-environment">
+      <header><div><Globe2 :size="14" /><span><strong>导出环境</strong><small>当前服务生成文件时使用的运行信息</small></span></div></header>
+      <div class="exports-environment-grid"><div><span>SQLite 数据库</span><strong class="font-mono" :title="dataPath">{{ dataPath || '使用当前运行数据库' }}</strong></div><div><span>公共基础地址</span><strong>{{ runtime.public_base_url || '按当前访问地址生成' }}</strong></div><div><span>全局 API Key</span><strong :class="publicAPIKeyReady ? 'text-emerald-600 dark:text-emerald-300' : 'text-amber-600 dark:text-amber-300'">{{ publicAPIKeyReady ? `已配置（${publicAPIKeySource}）` : '尚未设置' }}</strong></div></div>
+      <footer>运行数据导出包含 Apple 登录态、Cookie 和 App 专用密码等内容，请将下载文件保存在可信位置。</footer>
     </section>
   </div>
 </template>

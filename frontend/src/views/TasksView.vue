@@ -1,9 +1,10 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CheckCircle2, CircleAlert, Clock3, LoaderCircle, Play, Save, Settings, Square, Trash2, X } from '@lucide/vue'
 import { api } from '../api/client'
 import CardSelect from '../components/CardSelect.vue'
 import { useConfirm } from '../composables/useConfirm'
+import { subscribeRealtime } from '../composables/useRealtime'
 import { useToast } from '../composables/useToast'
 
 const loading = ref(true)
@@ -12,11 +13,21 @@ const initialized = ref(false)
 const showDefaults = ref(false)
 const scheduler = ref({ running: false, status: 'idle', events: [] })
 const accounts = ref([])
-const lastCreatedMailbox = ref(null)
-const form = reactive({ mode: 'once', account_id: '', account_ids: [], label: '', note: '', create_channel: 'auto', interval_minutes: 60, round_interval_seconds: 5 })
-const defaultForm = reactive({ label: '', note: '', account_ids: [], create_channel: 'auto', scheduler_create_channel: 'auto', apple_account_two_factor_method: 'trusted_device', icloud_web_two_factor_method: 'trusted_device', scheduler_interval_minutes: 60, scheduler_round_interval_seconds: 5, mailbox_page_size: 7 })
+const form = reactive({ mode: 'once', account_id: '', account_ids: [], label: '', note: '', create_channel: 'auto', interval_min_minutes: 60, interval_max_minutes: 60, account_interval_min_seconds: 5, account_interval_max_seconds: 5 })
+const defaultForm = reactive({ label: '', note: '', account_ids: [], create_channel: 'auto', scheduler_create_channel: 'auto', apple_account_two_factor_method: 'trusted_device', icloud_web_two_factor_method: 'trusted_device', scheduler_interval_min_minutes: 60, scheduler_interval_max_minutes: 60, scheduler_account_interval_min_seconds: 5, scheduler_account_interval_max_seconds: 5 })
 const { success, error: showError } = useToast()
 const { confirm: confirmAction } = useConfirm()
+let schedulerRefreshTimer = 0
+let realtimeRefreshTimer = 0
+let realtimeUnsubscribe = () => {}
+const pendingRealtimeResources = new Set()
+let schedulerRefreshPending = false
+let schedulerRefreshVersion = 0
+const logViewport = ref(null)
+const logViewportHeight = ref(251)
+const logEmptyHeight = ref(215)
+let logResizeTimer = 0
+let logLayoutObserver
 
 const accountOptions = computed(() => accounts.value.map((account) => ({ value: account.id, label: `${account.label || account.apple_id}（${account.apple_id}）` })))
 const schedulerEvents = computed(() => [...(scheduler.value.events || [])].reverse())
@@ -31,11 +42,19 @@ const selectedAccountCount = computed(() => {
   return Array.isArray(ids) ? ids.length : 0
 })
 const intervalSummary = computed(() => {
-  const seconds = scheduler.value.running ? scheduler.value.interval_seconds : Number(form.interval_minutes || 0) * 60
-  if (!seconds) return '-'
-  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`
-  if (seconds % 60 === 0) return `${seconds / 60} 分钟`
-  return `${seconds} 秒`
+  const minimum = scheduler.value.running
+    ? Number(scheduler.value.interval_min_seconds || 0)
+    : Number(form.interval_min_minutes || 0) * 60
+  const maximum = scheduler.value.running
+    ? Number(scheduler.value.interval_max_seconds || minimum)
+    : Number(form.interval_max_minutes || 0) * 60
+  if (!minimum) return '-'
+  const formatDuration = (seconds) => {
+    if (seconds % 3600 === 0) return `${seconds / 3600} 小时`
+    if (seconds % 60 === 0) return `${seconds / 60} 分钟`
+    return `${seconds} 秒`
+  }
+  return maximum > minimum ? `${formatDuration(minimum)}～${formatDuration(maximum)}` : formatDuration(minimum)
 })
 const nextRunSummary = computed(() => {
   if (!scheduler.value.running && form.mode === 'once') return '点击后立即创建'
@@ -65,10 +84,6 @@ function statusClass(status) {
   return 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-300'
 }
 
-function channelText(channel) {
-  return ({ auto: '自动接口：新接口优先，失败用旧接口', apple_account: 'Apple Account 新接口', icloud_web: 'iCloud Web 旧接口' })[channel] || channel || '-'
-}
-
 function modeText(mode) {
   return mode === 'scheduled' ? '自动创建' : '创建一个'
 }
@@ -91,8 +106,10 @@ function applyDefaults() {
   form.create_channel = form.mode === 'scheduled'
     ? (defaultForm.scheduler_create_channel || 'auto')
     : (defaultForm.create_channel || 'auto')
-  form.interval_minutes = defaultForm.scheduler_interval_minutes || 60
-  form.round_interval_seconds = defaultForm.scheduler_round_interval_seconds || 5
+  form.interval_min_minutes = defaultForm.scheduler_interval_min_minutes || 60
+  form.interval_max_minutes = defaultForm.scheduler_interval_max_minutes || form.interval_min_minutes
+  form.account_interval_min_seconds = defaultForm.scheduler_account_interval_min_seconds || 5
+  form.account_interval_max_seconds = defaultForm.scheduler_account_interval_max_seconds || form.account_interval_min_seconds
 }
 
 function assignDefaultSettings(settings = {}) {
@@ -106,10 +123,16 @@ function assignDefaultSettings(settings = {}) {
     scheduler_create_channel: 'auto',
     apple_account_two_factor_method: 'trusted_device',
     icloud_web_two_factor_method: 'trusted_device',
-    scheduler_interval_minutes: 60,
-    scheduler_round_interval_seconds: 5,
-    mailbox_page_size: 7,
-  }, displaySettings)
+    scheduler_interval_min_minutes: 60,
+    scheduler_interval_max_minutes: 60,
+    scheduler_account_interval_min_seconds: 5,
+    scheduler_account_interval_max_seconds: 5,
+  }, displaySettings, {
+    scheduler_interval_min_minutes: Number(displaySettings.scheduler_interval_min_minutes || 60),
+    scheduler_interval_max_minutes: Number(displaySettings.scheduler_interval_max_minutes || displaySettings.scheduler_interval_min_minutes || 60),
+    scheduler_account_interval_min_seconds: Number(displaySettings.scheduler_account_interval_min_seconds || 5),
+    scheduler_account_interval_max_seconds: Number(displaySettings.scheduler_account_interval_max_seconds || displaySettings.scheduler_account_interval_min_seconds || 5),
+  })
 }
 
 function eventTypeText(type) {
@@ -129,13 +152,54 @@ function formatTime(value) {
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date)
 }
 
+function calculateLogViewportHeight() {
+  const element = logViewport.value
+  if (!element) return
+
+  const scrollContainer = element.closest('.page-scroll')
+  const scrollTop = scrollContainer?.scrollTop || 0
+  const viewportTop = element.getBoundingClientRect().top + scrollTop
+  const scrollBottom = scrollContainer?.getBoundingClientRect().bottom || window.innerHeight
+  const scrollStyle = scrollContainer ? window.getComputedStyle(scrollContainer) : null
+  const bottomPadding = Number.parseFloat(scrollStyle?.paddingBottom || '0') || 0
+  const measuredHeaderHeight = element.querySelector('thead')?.getBoundingClientRect().height || 36
+  const dataRow = element.querySelector('tbody tr:not(.task-log-empty-row)')
+  const measuredRowHeight = dataRow?.getBoundingClientRect().height || 43
+  const tableWidth = element.querySelector('table')?.scrollWidth || 0
+  const hasHorizontalScrollbar = tableWidth > element.clientWidth + 1
+  const reservedHeight = (hasHorizontalScrollbar ? 8 : 0) + 1
+  const minimumRows = window.matchMedia('(max-width: 620px)').matches ? 3 : 5
+  const availableHeight = scrollBottom - viewportTop - bottomPadding - 2
+  const visibleRows = Math.max(minimumRows, Math.floor((availableHeight - measuredHeaderHeight - reservedHeight) / measuredRowHeight))
+
+  logEmptyHeight.value = Math.floor(visibleRows * measuredRowHeight)
+  logViewportHeight.value = Math.floor(measuredHeaderHeight + logEmptyHeight.value + reservedHeight)
+}
+
+function scheduleLogViewportHeight() {
+  window.clearTimeout(logResizeTimer)
+  logResizeTimer = window.setTimeout(calculateLogViewportHeight, 80)
+}
+
 function notify(text, isError = false) {
   if (isError) showError(text)
   else success(text)
 }
 
-async function load() {
-  loading.value = true
+async function copyEmail(value) {
+  const email = String(value || '').trim()
+  if (!email) return
+  try {
+    await navigator.clipboard.writeText(email)
+    success('邮箱已复制')
+  } catch {
+    showError('邮箱复制失败，请手动复制')
+  }
+}
+
+async function load(options = {}) {
+  const silent = Boolean(options.silent)
+  if (!silent) loading.value = true
   try {
     const [schedulerData, accountData, createData] = await Promise.all([api('/api/scheduler/status'), api('/api/apple-accounts'), api('/api/create-settings')])
     scheduler.value = schedulerData.scheduler || scheduler.value
@@ -149,7 +213,36 @@ async function load() {
   } catch (err) {
     notify(err.message, true)
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
+  }
+}
+
+function scheduleRealtimeRefresh(change) {
+	if (change.resource === 'scheduler' && change.payload?.data) {
+		scheduler.value = change.payload.data
+		return
+	}
+  pendingRealtimeResources.add(change.resource)
+  window.clearTimeout(realtimeRefreshTimer)
+  realtimeRefreshTimer = window.setTimeout(() => {
+    const resources = new Set(pendingRealtimeResources)
+    pendingRealtimeResources.clear()
+    if (resources.has('scheduler')) void refreshScheduler()
+    if (resources.has('apple-account') || resources.has('create-settings')) void load({ silent: true })
+  }, 120)
+}
+
+async function refreshScheduler() {
+  if (schedulerRefreshPending || loading.value || busy.value) return
+  schedulerRefreshPending = true
+  const refreshVersion = schedulerRefreshVersion
+  try {
+    const data = await api('/api/scheduler/status')
+    if (refreshVersion === schedulerRefreshVersion) scheduler.value = data.scheduler || scheduler.value
+  } catch {
+    // 后台刷新失败时保留当前数据，下一轮会自动重试。
+  } finally {
+    schedulerRefreshPending = false
   }
 }
 
@@ -170,8 +263,9 @@ async function saveDefaults() {
 
 async function start() {
   busy.value = 'start'
+  schedulerRefreshVersion++
   try {
-    const data = await api('/api/scheduler/start', { method: 'POST', body: JSON.stringify({ account_ids: form.account_ids, label: form.label, note: form.note, create_channel: form.create_channel, interval_minutes: form.interval_minutes, round_interval_seconds: form.round_interval_seconds }) })
+    const data = await api('/api/scheduler/start', { method: 'POST', body: JSON.stringify({ account_ids: form.account_ids, label: form.label, note: form.note, create_channel: form.create_channel, interval_min_minutes: form.interval_min_minutes, interval_max_minutes: form.interval_max_minutes, account_interval_min_seconds: form.account_interval_min_seconds, account_interval_max_seconds: form.account_interval_max_seconds }) })
     scheduler.value = data.scheduler || data.data?.scheduler || scheduler.value
     notify('定时创建已启动')
     await load()
@@ -185,9 +279,9 @@ async function start() {
 async function createOne() {
   if (!form.account_id) return
   busy.value = 'create-one'
+  schedulerRefreshVersion++
   try {
     const result = await api(`/api/apple-accounts/${form.account_id}/mailboxes`, { method: 'POST', body: JSON.stringify({ label: form.label, note: form.note, channel: form.create_channel }) })
-    lastCreatedMailbox.value = result.mailbox
     scheduler.value = result.scheduler || scheduler.value
     form.label = defaultForm.label || ''
     form.note = defaultForm.note || ''
@@ -207,6 +301,7 @@ async function createOne() {
 
 async function stop() {
   busy.value = 'stop'
+  schedulerRefreshVersion++
   try {
     const data = await api('/api/scheduler/stop', { method: 'POST', body: '{}' })
     scheduler.value = data.scheduler || data.data?.scheduler || scheduler.value
@@ -228,6 +323,7 @@ async function clearLogs() {
   })
   if (!confirmed) return
   busy.value = 'clear'
+  schedulerRefreshVersion++
   try {
     await api('/api/scheduler/logs/clear', { method: 'POST', body: '{}' })
     scheduler.value.events = []
@@ -239,85 +335,120 @@ async function clearLogs() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  realtimeUnsubscribe = subscribeRealtime(['scheduler', 'apple-account', 'create-settings'], scheduleRealtimeRefresh)
+  schedulerRefreshTimer = window.setInterval(refreshScheduler, 30000)
+  logLayoutObserver = new ResizeObserver(scheduleLogViewportHeight)
+  logLayoutObserver.observe(document.querySelector('.page-scroll'))
+  window.addEventListener('resize', scheduleLogViewportHeight)
+})
+
+watch([loading, () => scheduler.value.last_error], async () => {
+  await nextTick()
+  scheduleLogViewportHeight()
+})
+
+onBeforeUnmount(() => {
+  schedulerRefreshVersion++
+  window.clearInterval(schedulerRefreshTimer)
+  window.clearTimeout(realtimeRefreshTimer)
+  pendingRealtimeResources.clear()
+  realtimeUnsubscribe()
+  window.clearTimeout(logResizeTimer)
+  window.removeEventListener('resize', scheduleLogViewportHeight)
+  logLayoutObserver?.disconnect()
+})
 </script>
 
 <template>
-  <div class="mx-auto max-w-7xl space-y-5">
-    <div v-if="loading" class="flex min-h-64 items-center justify-center text-slate-400"><LoaderCircle :size="24" class="animate-spin" /></div>
+  <div class="task-page">
+    <div v-if="loading" class="task-loading"><LoaderCircle :size="22" class="animate-spin" /><span>正在加载创建任务</span></div>
     <template v-else>
-      <div class="grid items-stretch gap-5 xl:grid-cols-[minmax(0,1fr)_330px]">
-        <section class="panel p-5 sm:p-6">
-          <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <h2 class="text-lg font-black">创建隐私邮箱</h2>
-            <div class="flex shrink-0 items-center gap-2 self-start"><span :class="statusClass(displayedStatus)" class="rounded-full px-3 py-1.5 text-xs font-bold">{{ statusText(displayedStatus) }}</span><button type="button" class="icon-button h-8 w-8 rounded-lg" title="创建与调度设置" aria-label="打开创建与调度设置" @click="showDefaults = true"><Settings :size="16" /></button></div>
+      <section class="panel task-workbench">
+        <div class="task-command-bar">
+          <div class="task-command-controls">
+            <div class="task-control task-mode-control">
+              <span class="task-control-label">执行方式</span>
+              <CardSelect v-model="form.mode" :options="modeOptions" aria-label="执行方式" compact @change="syncModeDefaults" />
+            </div>
+            <div class="task-control task-account-control">
+              <span class="task-control-label">参与 Apple 账号</span>
+              <CardSelect v-if="form.mode === 'once'" v-model="form.account_id" :options="accountOptions" placeholder="请选择一个账号" aria-label="参与 Apple 账号" compact />
+              <CardSelect v-else v-model="form.account_ids" :options="accountOptions" placeholder="请选择参与账号" aria-label="参与 Apple 账号" compact multiple />
+            </div>
+            <div class="task-control task-channel-control">
+              <span class="task-control-label">创建通道</span>
+              <CardSelect v-model="form.create_channel" :options="createChannelOptions" aria-label="创建通道" compact />
+            </div>
+            <label class="task-control task-label-control"><span class="task-control-label">标签前缀</span><input v-model.trim="form.label" class="field task-command-input" placeholder="可选，默认 x" /></label>
+            <label class="task-control task-note-control"><span class="task-control-label">备注</span><input v-model.trim="form.note" class="field task-command-input" placeholder="可选备注" /></label>
           </div>
+          <div class="task-command-actions">
+            <span :class="statusClass(displayedStatus)" class="task-status-badge">{{ statusText(displayedStatus) }}</span>
+            <button type="button" class="icon-button task-settings-button" title="创建与调度设置" aria-label="打开创建与调度设置" @click="showDefaults = true"><Settings :size="16" /></button>
+            <button v-if="scheduler.running" class="secondary-button task-run-button task-stop-button" :disabled="busy === 'stop'" @click="stop"><LoaderCircle v-if="busy === 'stop'" :size="15" class="animate-spin" /><Square v-else :size="15" /><span>停止任务</span></button>
+            <button v-else-if="form.mode === 'once'" class="primary-button task-run-button" :disabled="busy === 'create-one' || !form.account_id" @click="createOne"><LoaderCircle v-if="busy === 'create-one'" :size="15" class="animate-spin" /><Play v-else :size="15" /><span>创建一个</span></button>
+            <button v-else class="primary-button task-run-button" :disabled="busy === 'start' || !form.account_ids.length" @click="start"><LoaderCircle v-if="busy === 'start'" :size="15" class="animate-spin" /><Play v-else :size="15" /><span>启动任务</span></button>
+          </div>
+        </div>
 
-          <div class="mt-6 grid gap-4 md:grid-cols-2">
-            <div class="form-group"><span class="form-label">执行方式</span><CardSelect v-model="form.mode" :options="modeOptions" aria-label="执行方式" @change="syncModeDefaults" /><span class="form-help">创建一个会立即执行；自动创建会持续运行。</span></div>
-            <div class="form-group"><span class="form-label">参与 Apple 账号</span><CardSelect v-if="form.mode === 'once'" v-model="form.account_id" :options="accountOptions" placeholder="请选择一个账号" aria-label="参与 Apple 账号" /><CardSelect v-else v-model="form.account_ids" :options="accountOptions" placeholder="请选择参与账号" aria-label="参与 Apple 账号" multiple /><span class="form-help">{{ form.mode === 'once' ? '单次创建只选择一个账号。' : '默认选择一个账号，也可以继续多选。' }}</span></div>
-            <div class="form-group"><span class="form-label">创建通道</span><CardSelect v-model="form.create_channel" :options="createChannelOptions" aria-label="创建通道" /><span class="form-help">自动接口会先尝试 Apple Account 新接口，失败后使用 iCloud Web 旧接口。</span></div>
-            <label class="form-group"><span class="form-label">邮箱标签前缀</span><input v-model.trim="form.label" class="field" placeholder="可选" /><span class="form-help">留空默认使用 x，并根据已有最大编号生成 x_1、x_2、x_3。</span></label>
-            <label class="form-group md:col-span-2"><span class="form-label">备注</span><textarea v-model.trim="form.note" class="field min-h-20 resize-y" placeholder="可选备注" /></label>
-          </div>
+        <div class="task-summary" aria-label="任务概览">
+          <div class="task-summary-title"><span class="task-summary-icon"><Clock3 :size="16" /></span><span><strong>任务概览</strong><small>实时调度状态</small></span></div>
+          <dl><dt>参与账号</dt><dd>{{ selectedAccountCount }}</dd></dl>
+          <dl><dt>执行方式</dt><dd>{{ scheduler.running ? '自动创建' : modeText(form.mode) }}</dd></dl>
+          <dl><dt>创建成功</dt><dd class="task-success-value">{{ scheduler.success || 0 }}</dd></dl>
+          <dl><dt>创建失败</dt><dd class="task-failed-value">{{ scheduler.failed || 0 }}</dd></dl>
+          <dl><dt>轮次间隔</dt><dd>{{ scheduler.running || form.mode === 'scheduled' ? intervalSummary : '—' }}</dd></dl>
+          <dl class="task-summary-wide"><dt>下次执行</dt><dd>{{ nextRunSummary }}</dd></dl>
+          <dl class="task-summary-wide"><dt>最近执行</dt><dd>{{ formatTime(scheduler.last_run_at) }}</dd></dl>
+        </div>
 
-          <div class="mt-5 flex justify-end gap-2">
-            <button v-if="scheduler.running" class="secondary-button" :disabled="busy === 'stop'" @click="stop"><LoaderCircle v-if="busy === 'stop'" :size="16" class="animate-spin" /><Square v-else :size="16" />停止定时创建</button>
-            <button v-else-if="form.mode === 'once'" class="primary-button" :disabled="busy === 'create-one' || !form.account_id" @click="createOne"><LoaderCircle v-if="busy === 'create-one'" :size="16" class="animate-spin" /><Play v-else :size="16" />创建一个</button>
-            <button v-else class="primary-button" :disabled="busy === 'start' || !form.account_ids.length" @click="start"><LoaderCircle v-if="busy === 'start'" :size="16" class="animate-spin" /><Play v-else :size="16" />启动自动创建</button>
-          </div>
-        </section>
+        <div v-if="scheduler.last_error" class="task-notice-row" aria-live="polite">
+          <div class="task-notice task-notice-error"><CircleAlert :size="15" /><span>最近错误</span><strong>{{ scheduler.last_error }}</strong></div>
+        </div>
 
-        <aside class="panel flex h-full flex-col p-5">
-          <div class="flex items-center justify-between gap-3"><div class="flex items-center gap-2"><span class="flex h-9 w-9 items-center justify-center rounded-xl bg-sky-100 text-sky-600 dark:bg-sky-950/60 dark:text-sky-300"><Clock3 :size="18" /></span><div><h3 class="font-black">任务概览</h3><p class="mt-0.5 text-[10px] text-slate-400">当前调度运行数据</p></div></div></div>
-          <div class="mt-5 grid grid-cols-2 gap-2">
-            <div class="rounded-xl bg-slate-50 p-3 dark:bg-slate-800/70"><span class="text-[10px] text-slate-400">参与账号</span><strong class="mt-1 block text-xl">{{ selectedAccountCount }}</strong></div>
-            <div class="rounded-xl bg-slate-50 p-3 dark:bg-slate-800/70"><span class="text-[10px] text-slate-400">执行方式</span><strong class="mt-1 block text-base">{{ scheduler.running ? '自动创建' : modeText(form.mode) }}</strong></div>
-            <div class="rounded-xl bg-emerald-50 p-3 dark:bg-emerald-950/40"><span class="text-[10px] text-emerald-600 dark:text-emerald-300">创建成功</span><strong class="mt-1 block text-xl text-emerald-700 dark:text-emerald-200">{{ scheduler.success || 0 }}</strong></div>
-            <div class="rounded-xl bg-rose-50 p-3 dark:bg-rose-950/40"><span class="text-[10px] text-rose-500 dark:text-rose-300">创建失败</span><strong class="mt-1 block text-xl text-rose-600 dark:text-rose-200">{{ scheduler.failed || 0 }}</strong></div>
-          </div>
-          <dl class="mt-5 divide-y divide-slate-100 text-xs dark:divide-slate-700/70">
-            <div class="flex items-center justify-between gap-3 py-3"><dt class="text-slate-400">创建通道</dt><dd class="font-bold text-slate-700 dark:text-slate-200">{{ channelText(scheduler.running ? scheduler.create_channel : form.create_channel) }}</dd></div>
-            <div v-if="scheduler.running || form.mode === 'scheduled'" class="flex items-center justify-between gap-3 py-3"><dt class="text-slate-400">轮次间隔</dt><dd class="font-bold text-slate-700 dark:text-slate-200">{{ intervalSummary }}</dd></div>
-            <div class="flex items-center justify-between gap-3 py-3"><dt class="text-slate-400">下次执行</dt><dd class="font-bold text-slate-700 dark:text-slate-200">{{ nextRunSummary }}</dd></div>
-            <div class="flex items-center justify-between gap-3 py-3"><dt class="text-slate-400">最近执行</dt><dd class="font-bold text-slate-700 dark:text-slate-200">{{ formatTime(scheduler.last_run_at) }}</dd></div>
-          </dl>
-          <div v-if="lastCreatedMailbox" class="mt-auto rounded-xl bg-emerald-50 p-3 text-xs leading-5 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200"><span class="block text-[10px] text-emerald-500">刚刚创建</span><strong class="mt-0.5 block break-all">{{ lastCreatedMailbox.email }}</strong></div>
-          <div v-if="scheduler.last_error" class="mt-auto rounded-xl bg-rose-50 p-3 text-xs leading-5 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300">{{ scheduler.last_error }}</div>
-        </aside>
-      </div>
-
-      <section class="panel overflow-hidden">
-        <div class="flex items-center justify-between gap-4 border-b border-slate-100 px-5 py-4 dark:border-slate-700"><div><h3 class="font-black">调度日志</h3><p class="mt-0.5 text-xs text-slate-400">记录启动、轮次、创建结果和等待状态</p></div><div class="flex items-center gap-2"><span class="text-xs text-slate-400">{{ schedulerEvents.length }} 条</span><button class="icon-button" title="清除调度日志" :disabled="busy === 'clear' || !schedulerEvents.length" @click="clearLogs"><LoaderCircle v-if="busy === 'clear'" :size="16" class="animate-spin" /><Trash2 v-else :size="16" /></button></div></div>
-        <div v-if="!schedulerEvents.length" class="flex h-32 items-center justify-center text-sm text-slate-400">暂无调度记录</div>
-        <div v-else class="h-32 overflow-y-auto [scrollbar-gutter:stable]">
-          <div v-for="event in schedulerEvents" :key="event.id" class="flex h-16 items-center gap-3 overflow-hidden border-b border-slate-100 px-5 py-3.5 dark:border-slate-700/70">
-            <span :class="eventTone(event.type)" class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg"><CircleAlert v-if="event.type === 'failed'" :size="15" /><CheckCircle2 v-else :size="15" /></span>
-            <div class="min-w-0 flex-1"><div class="flex min-w-0 items-center gap-2"><span class="shrink-0 rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500 dark:bg-slate-700 dark:text-slate-300">{{ eventTypeText(event.type) }}</span><strong class="truncate text-sm font-semibold text-slate-700 dark:text-slate-200" :title="event.message">{{ event.message }}</strong><span v-if="event.email" class="min-w-0 truncate font-mono text-xs text-emerald-600" :title="event.email">{{ event.email }}</span></div><p v-if="event.error" class="mt-1 truncate text-xs leading-5 text-rose-500" :title="event.error">{{ event.error }}</p></div>
-            <time class="shrink-0 text-[10px] text-slate-400">{{ formatTime(event.at) }}</time>
-          </div>
+        <div class="task-log-heading">
+          <div><h2>调度日志</h2><p>记录启动、轮次、创建结果和等待状态</p></div>
+          <div class="task-log-actions"><span>{{ schedulerEvents.length }} 条记录</span><button class="icon-button task-clear-button" title="清除调度日志" aria-label="清除调度日志" :disabled="busy === 'clear' || !schedulerEvents.length" @click="clearLogs"><LoaderCircle v-if="busy === 'clear'" :size="15" class="animate-spin" /><Trash2 v-else :size="15" /></button></div>
+        </div>
+        <div ref="logViewport" class="task-log-viewport" :style="{ '--task-log-height': `${logViewportHeight}px`, '--task-log-empty-height': `${logEmptyHeight}px` }">
+          <table class="task-log-table" :class="{ 'task-log-table-empty': !schedulerEvents.length }">
+            <colgroup><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /></colgroup>
+            <thead><tr><th>事件</th><th>邮箱</th><th>标签</th><th>详情</th><th>时间</th></tr></thead>
+            <tbody>
+              <tr v-for="event in schedulerEvents" :key="event.id">
+                <td><span :class="eventTone(event.type)" class="task-event-badge"><CircleAlert v-if="event.type === 'failed'" :size="13" /><CheckCircle2 v-else :size="13" />{{ eventTypeText(event.type) }}</span></td>
+                <td><button v-if="event.email" type="button" class="task-event-email" title="点击复制邮箱" :aria-label="`复制邮箱 ${event.email}`" @click="copyEmail(event.email)">{{ event.email }}</button><span v-else class="task-event-email-empty">—</span></td>
+                <td><span v-if="event.label" class="task-event-label" :title="event.label">{{ event.label }}</span><span v-else class="task-event-label-empty">—</span></td>
+                <td><span class="task-event-message" :title="event.message">{{ event.message }}</span></td>
+                <td><time>{{ formatTime(event.at) }}</time></td>
+              </tr>
+              <tr v-if="!schedulerEvents.length" class="task-log-empty-row"><td colspan="5" class="task-log-empty"><span class="task-empty-icon"><Clock3 :size="20" /></span><strong>暂无调度记录</strong><small>启动创建任务后，运行过程会显示在这里。</small></td></tr>
+            </tbody>
+          </table>
         </div>
       </section>
 
       <Teleport to="body">
-        <div v-if="showDefaults" class="fixed inset-0 z-[70] !m-0 flex items-center justify-center bg-slate-950/55 p-4 backdrop-blur-[3px]" role="presentation" @click.stop>
-          <form class="panel max-h-[calc(100vh-2rem)] w-full max-w-2xl overflow-y-auto p-5 shadow-2xl sm:p-6" role="dialog" aria-modal="true" aria-labelledby="create-defaults-title" @submit.prevent="saveDefaults">
-            <div class="flex items-start justify-between gap-4 border-b border-slate-100 pb-4 dark:border-slate-700">
-              <div><h2 id="create-defaults-title" class="flex items-center gap-2 text-lg font-black text-slate-900 dark:text-slate-100"><Settings :size="19" />创建与调度设置</h2><p class="mt-1 text-xs leading-5 text-slate-400">设置创建一个和自动创建的默认参数。</p></div>
-              <button type="button" class="icon-button h-8 w-8 rounded-lg" title="关闭设置" aria-label="关闭创建与调度设置" :disabled="busy === 'save-defaults'" @click="showDefaults = false"><X :size="17" /></button>
+        <div v-if="showDefaults" class="task-dialog-backdrop" role="presentation" @click.self="showDefaults = false">
+          <form class="panel task-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="create-defaults-title" @submit.prevent="saveDefaults">
+            <div class="task-dialog-heading">
+              <div><h2 id="create-defaults-title"><Settings :size="18" />创建与调度设置</h2><p>设置单次创建和自动创建的默认参数。</p></div>
+              <button type="button" class="icon-button" title="关闭设置" aria-label="关闭创建与调度设置" :disabled="busy === 'save-defaults'" @click="showDefaults = false"><X :size="16" /></button>
             </div>
 
-            <div class="mt-5 grid gap-4 sm:grid-cols-2">
+            <div class="task-settings-grid">
               <label class="form-group"><span class="form-label">默认标签前缀</span><input v-model.trim="defaultForm.label" class="field" placeholder="可选" /><span class="form-help">留空默认使用 x，并从现有最大编号继续创建。</span></label>
               <label class="form-group"><span class="form-label">默认备注</span><input v-model.trim="defaultForm.note" class="field" placeholder="可选" /></label>
               <div class="form-group"><span class="form-label">创建一个通道</span><CardSelect v-model="defaultForm.create_channel" :options="createChannelOptions" aria-label="创建一个通道" /></div>
               <div class="form-group"><span class="form-label">自动创建通道</span><CardSelect v-model="defaultForm.scheduler_create_channel" :options="createChannelOptions" aria-label="自动创建通道" /></div>
-              <label class="form-group"><span class="form-label">下一轮间隔（分钟）</span><input v-model.number="defaultForm.scheduler_interval_minutes" class="field" type="number" min="1" max="10080" /></label>
-              <label class="form-group"><span class="form-label">账号间隔（秒）</span><input v-model.number="defaultForm.scheduler_round_interval_seconds" class="field" type="number" min="1" max="3600" /></label>
+              <div class="form-group"><span class="form-label">下一轮间隔（随机分钟范围）</span><div class="task-interval-fields"><input v-model.number="defaultForm.scheduler_interval_min_minutes" class="field" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="最小" autocomplete="off" aria-label="下一轮最小间隔分钟" /><span class="task-interval-separator">到</span><input v-model.number="defaultForm.scheduler_interval_max_minutes" class="field" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="最大" autocomplete="off" aria-label="下一轮最大间隔分钟" /></div></div>
+              <div class="form-group"><span class="form-label">账号间隔（随机秒数范围）</span><div class="task-interval-fields"><input v-model.number="defaultForm.scheduler_account_interval_min_seconds" class="field" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="最小" autocomplete="off" aria-label="账号最小间隔秒数" /><span class="task-interval-separator">到</span><input v-model.number="defaultForm.scheduler_account_interval_max_seconds" class="field" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="最大" autocomplete="off" aria-label="账号最大间隔秒数" /></div></div>
             </div>
-            <div class="mt-4 form-group"><span class="form-label">默认参与账号</span><CardSelect v-model="defaultForm.account_ids" :options="accountOptions" placeholder="请选择默认参与账号" aria-label="默认参与账号" multiple /><span class="form-help">可以保存多个默认账号；进入页面时先选择第一个，也可以在自动创建中继续多选。</span></div>
+            <div class="task-default-accounts form-group"><span class="form-label">默认参与账号</span><CardSelect v-model="defaultForm.account_ids" :options="accountOptions" placeholder="请选择默认参与账号" aria-label="默认参与账号" multiple /><span class="form-help">可以保存多个默认账号；进入页面时先选择第一个，也可以在自动创建中继续多选。</span></div>
 
-            <div class="mt-6 flex justify-end gap-2">
+            <div class="task-dialog-actions">
               <button type="button" class="secondary-button" :disabled="busy === 'save-defaults'" @click="showDefaults = false">取消</button>
               <button type="submit" class="primary-button" :disabled="busy === 'save-defaults'"><LoaderCircle v-if="busy === 'save-defaults'" :size="16" class="animate-spin" /><Save v-else :size="16" />保存设置</button>
             </div>

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -20,25 +21,23 @@ type DeleteAppleAccountResult struct {
 func (s *Store) FindAppleAccount(id string) (domain.AppleAccount, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	id = strings.TrimSpace(id)
-	for _, account := range s.state.AppleAccounts {
-		if account.ID == id {
-			return account, true
+	var account domain.AppleAccount
+	found, err := s.readEntity("apple_accounts", strings.TrimSpace(id), &account)
+	if found && err == nil {
+		var session domain.ICloudSession
+		if sessionFound, sessionErr := s.readEntity("icloud_sessions", account.ID, &session); sessionErr == nil && sessionFound {
+			account.ICloudStatus = iCloudStatusFromSession(session)
 		}
 	}
-	return domain.AppleAccount{}, false
+	return account, found && err == nil
 }
 
 func (s *Store) ICloudSessionByAccountID(accountID string) (domain.ICloudSession, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	accountID = strings.TrimSpace(accountID)
-	for _, session := range s.state.ICloudSessions {
-		if session.AccountID == accountID {
-			return cloneICloudSession(session), true
-		}
-	}
-	return domain.ICloudSession{}, false
+	var session domain.ICloudSession
+	found, err := s.readEntity("icloud_sessions", strings.TrimSpace(accountID), &session)
+	return cloneICloudSession(session), found && err == nil
 }
 
 func (s *Store) SaveICloudSession(session domain.ICloudSession) (domain.ICloudSession, error) {
@@ -56,216 +55,259 @@ func (s *Store) SaveICloudSessionWithEvent(session domain.ICloudSession, level, 
 func (s *Store) saveICloudSession(session domain.ICloudSession, level, updateMessage, createMessage string) (domain.ICloudSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return domain.ICloudSession{}, err
+	}
 	level = strings.TrimSpace(level)
 	if level == "" {
 		level = "info"
 	}
-	if strings.TrimSpace(session.AccountID) != "" {
-		accountExists := false
-		for _, account := range s.state.AppleAccounts {
-			if account.ID == strings.TrimSpace(session.AccountID) {
-				accountExists = true
-				break
-			}
-		}
-		if !accountExists {
-			return domain.ICloudSession{}, errors.New("Apple 账号不存在")
+	accountID := strings.TrimSpace(session.AccountID)
+	var account domain.AppleAccount
+	accountCreated := false
+	if accountID == "" {
+		accountID, err = s.findAppleAccountIDBySessionTx(tx, session)
+		if err != nil {
+			_ = tx.Rollback()
+			return domain.ICloudSession{}, err
 		}
 	}
-	if s.state.Admin != nil && strings.TrimSpace(session.OwnerID) == "" {
-		session.OwnerID = s.state.Admin.ID
+	if accountID != "" {
+		if found, err := s.readEntityTx(tx, "apple_accounts", accountID, &account); err != nil || !found {
+			_ = tx.Rollback()
+			if err != nil {
+				return domain.ICloudSession{}, err
+			}
+			return domain.ICloudSession{}, errors.New("Apple 账号不存在")
+		}
+	} else {
+		accountID, err = s.nextIDTx(tx, "acc")
+		if err != nil {
+			_ = tx.Rollback()
+			return domain.ICloudSession{}, err
+		}
+		now := time.Now()
+		account = domain.AppleAccount{ID: accountID, Label: firstNonEmpty(session.AppleID, "Apple 账号"), AppleID: strings.TrimSpace(session.AppleID), Status: domain.StatusActive, ICloudStatus: iCloudStatusFromSession(session), Note: session.Note, CreatedAt: now, UpdatedAt: now}
+		session.AccountID = accountID
+		accountCreated = true
 	}
 	if session.SavedAt.IsZero() {
 		session.SavedAt = time.Now()
 	}
-	if strings.TrimSpace(session.AccountID) == "" {
-		session.AccountID = s.ensureAppleAccountLocked(session)
-	} else {
-		s.touchAppleAccountLocked(session.AccountID, session)
-	}
-	for i, existing := range s.state.ICloudSessions {
-		if sameICloudSessionIdentity(existing, session) {
-			merged := mergeICloudSession(existing, session)
-			s.state.ICloudSessions[i] = merged
-			s.touchAppleAccountLocked(merged.AccountID, merged)
-			s.appendEventLocked(level, "apple", updateMessage)
-			return cloneICloudSession(merged), s.saveLocked()
+	if session.OwnerID == "" {
+		var adminData []byte
+		var admin domain.Admin
+		if tx.QueryRow(`SELECT data_json FROM admins LIMIT 1`).Scan(&adminData) == nil && s.decodeEntity("admins", adminData, &admin) == nil {
+			session.OwnerID = admin.ID
 		}
 	}
-	s.state.ICloudSessions = append(s.state.ICloudSessions, cloneICloudSession(session))
-	s.touchAppleAccountLocked(session.AccountID, session)
-	s.appendEventLocked(level, "apple", createMessage)
-	return cloneICloudSession(session), s.saveLocked()
-}
-
-// DeleteAppleAccount 删除本地 Apple 账号及其关联登录态、邮箱和邮件。
-func (s *Store) DeleteAppleAccount(id string) (DeleteAppleAccountResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id = strings.TrimSpace(id)
-	accountIndex := -1
-	var account domain.AppleAccount
-	for index, candidate := range s.state.AppleAccounts {
-		if candidate.ID == id {
-			accountIndex = index
-			account = candidate
-			break
-		}
+	var existing domain.ICloudSession
+	exists, err := s.readEntityTx(tx, "icloud_sessions", accountID, &existing)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.ICloudSession{}, err
 	}
-	if accountIndex < 0 {
-		return DeleteAppleAccountResult{}, errors.New("Apple 账号不存在")
+	if exists {
+		session = mergeICloudSession(existing, session)
 	}
-
-	result := DeleteAppleAccountResult{AccountID: account.ID, AppleID: account.AppleID}
-	s.state.AppleAccounts = append(s.state.AppleAccounts[:accountIndex], s.state.AppleAccounts[accountIndex+1:]...)
-
-	sessions := s.state.ICloudSessions[:0]
-	for _, session := range s.state.ICloudSessions {
-		if session.AccountID == id {
-			result.ICloudSessions++
-			continue
-		}
-		sessions = append(sessions, session)
-	}
-	s.state.ICloudSessions = sessions
-
-	deletedMailboxIDs := make(map[string]struct{})
-	mailboxes := s.state.Mailboxes[:0]
-	for _, mailbox := range s.state.Mailboxes {
-		if mailbox.AccountID == id {
-			result.Mailboxes++
-			deletedMailboxIDs[mailbox.ID] = struct{}{}
-			s.closeMailboxLeasesForDeletionLocked(mailbox.ID, time.Now(), "Apple 账号已由管理员删除")
-			continue
-		}
-		mailboxes = append(mailboxes, mailbox)
-	}
-	s.state.Mailboxes = mailboxes
-
-	messages := s.state.Messages[:0]
-	for _, message := range s.state.Messages {
-		if _, deleted := deletedMailboxIDs[message.MailboxID]; deleted {
-			result.Messages++
-			continue
-		}
-		messages = append(messages, message)
-	}
-	s.state.Messages = messages
-
-	accountIDs := s.state.CreateSettings.AccountIDs[:0]
-	for _, accountID := range s.state.CreateSettings.AccountIDs {
-		if accountID != id {
-			accountIDs = append(accountIDs, accountID)
-		}
-	}
-	s.state.CreateSettings.AccountIDs = accountIDs
-	s.appendEventLocked("warning", "apple", "已删除本地 Apple 账号 "+firstNonEmpty(account.AppleID, account.ID))
-	return result, s.saveLocked()
-}
-
-func (s *Store) UpdateICloudSession(accountID string, update func(*domain.ICloudSession) error) (domain.ICloudSession, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	accountID = strings.TrimSpace(accountID)
-	for i := range s.state.ICloudSessions {
-		if s.state.ICloudSessions[i].AccountID != accountID {
-			continue
-		}
-		next := cloneICloudSession(s.state.ICloudSessions[i])
-		if err := update(&next); err != nil {
-			return domain.ICloudSession{}, err
-		}
-		s.state.ICloudSessions[i] = next
-		s.touchAppleAccountLocked(accountID, next)
-		return cloneICloudSession(next), s.saveLocked()
-	}
-	return domain.ICloudSession{}, errors.New("Apple 账号登录态不存在")
-}
-
-func (s *Store) ensureAppleAccountLocked(session domain.ICloudSession) string {
-	appleID := strings.TrimSpace(session.AppleID)
-	for i, account := range s.state.AppleAccounts {
-		if appleID != "" && strings.EqualFold(account.AppleID, appleID) {
-			s.updateAppleAccountFromSessionLocked(i, session)
-			return account.ID
-		}
-	}
-	now := time.Now()
-	label := appleID
-	if label == "" {
-		label = "Apple 账号 " + now.Format("0102-150405")
-	}
-	account := domain.AppleAccount{
-		ID:           s.nextIDLocked("acc"),
-		OwnerID:      session.OwnerID,
-		Label:        label,
-		AppleID:      appleID,
-		Status:       domain.StatusActive,
-		ICloudStatus: iCloudStatusFromSession(session),
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-	s.state.AppleAccounts = append(s.state.AppleAccounts, account)
-	return account.ID
-}
-
-func (s *Store) touchAppleAccountLocked(accountID string, session domain.ICloudSession) {
-	for i, account := range s.state.AppleAccounts {
-		if account.ID == strings.TrimSpace(accountID) {
-			s.updateAppleAccountFromSessionLocked(i, session)
-			return
-		}
-	}
-}
-
-func (s *Store) updateAppleAccountFromSessionLocked(index int, session domain.ICloudSession) {
-	if index < 0 || index >= len(s.state.AppleAccounts) {
-		return
-	}
-	account := &s.state.AppleAccounts[index]
-	if appleID := strings.TrimSpace(session.AppleID); appleID != "" {
-		account.AppleID = appleID
-		if strings.TrimSpace(account.Label) == "" {
-			account.Label = appleID
-		}
+	session.AccountID = accountID
+	account.OwnerID = firstNonEmpty(account.OwnerID, session.OwnerID)
+	account.AppleID = firstNonEmpty(session.AppleID, account.AppleID)
+	if account.Label == "" {
+		account.Label = firstNonEmpty(account.AppleID, "Apple 账号")
 	}
 	account.Status = domain.StatusActive
 	account.ICloudStatus = iCloudStatusFromSession(session)
+	account.Note = firstNonEmpty(session.Note, account.Note)
 	account.UpdatedAt = time.Now()
+	changes := []Change{}
+	accountChange, accountChanged, err := s.upsertEntityTx(tx, "apple_accounts", "apple-account", account.ID, account)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.ICloudSession{}, err
+	}
+	if accountChanged {
+		changes = append(changes, accountChange)
+	}
+	sessionChange, sessionChanged, err := s.upsertEntityTx(tx, "icloud_sessions", "apple-session", accountID, session)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.ICloudSession{}, err
+	}
+	if sessionChanged {
+		changes = append(changes, sessionChange)
+	}
+	if !accountChanged && !sessionChanged {
+		_ = tx.Rollback()
+		return cloneICloudSession(session), nil
+	}
+	message := updateMessage
+	if accountCreated || !exists {
+		message = createMessage
+	}
+	eventChange, err := s.appendEventTx(tx, level, "apple", message)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.ICloudSession{}, err
+	}
+	changes = append(changes, eventChange)
+	return cloneICloudSession(session), s.commitTx(tx, changes)
+}
+
+// findAppleAccountIDBySessionTx 按 DSID 和 Apple ID 查找已有账号，保证重新登录时更新原记录。
+func (s *Store) findAppleAccountIDBySessionTx(tx *sql.Tx, session domain.ICloudSession) (string, error) {
+	dsid := strings.TrimSpace(session.DSID)
+	if dsid != "" {
+		var accountID string
+		err := tx.QueryRow(`SELECT id FROM icloud_sessions
+			WHERE trim(COALESCE(json_extract(data_json, '$.dsid'), '')) = ?
+			ORDER BY COALESCE(json_extract(data_json, '$.saved_at'), updated_at), id
+			LIMIT 1`, dsid).Scan(&accountID)
+		if err == nil {
+			return strings.TrimSpace(accountID), nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+
+	appleID := strings.TrimSpace(session.AppleID)
+	if appleID == "" {
+		return "", nil
+	}
+	var accountID string
+	err := tx.QueryRow(`SELECT id FROM apple_accounts
+		WHERE lower(trim(COALESCE(json_extract(data_json, '$.apple_id'), ''))) = lower(?)
+		ORDER BY COALESCE(json_extract(data_json, '$.created_at'), updated_at), id
+		LIMIT 1`, appleID).Scan(&accountID)
+	if err == nil {
+		return strings.TrimSpace(accountID), nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+
+	err = tx.QueryRow(`SELECT id FROM icloud_sessions
+		WHERE lower(trim(COALESCE(json_extract(data_json, '$.apple_id'), ''))) = lower(?)
+		ORDER BY COALESCE(json_extract(data_json, '$.saved_at'), updated_at), id
+		LIMIT 1`, appleID).Scan(&accountID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(accountID), nil
+}
+
+// DeleteAppleAccount 删除数据库中的 Apple 账号、登录态、关联邮箱、租约和邮件。
+func (s *Store) DeleteAppleAccount(id string) (DeleteAppleAccountResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return DeleteAppleAccountResult{}, err
+	}
+	var account domain.AppleAccount
+	if found, err := s.readEntityTx(tx, "apple_accounts", id, &account); err != nil || !found {
+		_ = tx.Rollback()
+		if err != nil {
+			return DeleteAppleAccountResult{}, err
+		}
+		return DeleteAppleAccountResult{}, errors.New("Apple 账号不存在")
+	}
+	result := DeleteAppleAccountResult{AccountID: account.ID, AppleID: account.AppleID}
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM mailboxes WHERE json_extract(data_json, '$.account_id') = ?`, id).Scan(&result.Mailboxes)
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM messages WHERE json_extract(data_json, '$.mailbox_id') IN (SELECT id FROM mailboxes WHERE json_extract(data_json, '$.account_id') = ?)`, id).Scan(&result.Messages)
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM icloud_sessions WHERE id = ?`, id).Scan(&result.ICloudSessions)
+	if _, err := tx.Exec(`DELETE FROM messages WHERE json_extract(data_json, '$.mailbox_id') IN (SELECT id FROM mailboxes WHERE json_extract(data_json, '$.account_id') = ?)`, id); err != nil {
+		_ = tx.Rollback()
+		return DeleteAppleAccountResult{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM mailbox_leases WHERE json_extract(data_json, '$.mailbox_id') IN (SELECT id FROM mailboxes WHERE json_extract(data_json, '$.account_id') = ?)`, id); err != nil {
+		_ = tx.Rollback()
+		return DeleteAppleAccountResult{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM mailboxes WHERE json_extract(data_json, '$.account_id') = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return DeleteAppleAccountResult{}, err
+	}
+	_, _ = tx.Exec(`DELETE FROM icloud_sessions WHERE id = ?`, id)
+	change, _, err := s.deleteEntityTx(tx, "apple_accounts", "apple-account", id)
+	if err != nil {
+		_ = tx.Rollback()
+		return DeleteAppleAccountResult{}, err
+	}
+	eventChange, err := s.appendEventTx(tx, "warning", "apple", "已删除 Apple 账号及其全部本地关联数据 "+firstNonEmpty(account.AppleID, account.ID))
+	if err != nil {
+		_ = tx.Rollback()
+		return DeleteAppleAccountResult{}, err
+	}
+	return result, s.commitTx(tx, []Change{change, eventChange})
+}
+
+func (s *Store) UpdateICloudSession(accountID string, update func(*domain.ICloudSession) error) (domain.ICloudSession, error) {
+	accountID = strings.TrimSpace(accountID)
+	session, ok := s.ICloudSessionByAccountID(accountID)
+	if !ok {
+		return domain.ICloudSession{}, errors.New("Apple 账号登录态不存在")
+	}
+	if err := update(&session); err != nil {
+		return domain.ICloudSession{}, err
+	}
+	return s.SaveICloudSession(session)
 }
 
 func iCloudStatusFromSession(session domain.ICloudSession) string {
-	if len(session.Cookies) > 0 {
-		if !session.IsICloudPlus {
-			return domain.ICloudStatusNoICloudPlus
-		}
-		if session.CanCreateHME {
-			return domain.ICloudStatusActive
-		}
-	}
+	successes := 0
+	failures := 0
 	for _, state := range session.LoginStates {
-		if state.Kind == domain.LoginStateAppleAccount && strings.TrimSpace(state.Scnt) != "" {
-			return domain.ICloudStatusActive
+		if state.LastCheckedAt.IsZero() {
+			continue
 		}
-		if state.Kind == domain.LoginStateICloudIMAP && strings.TrimSpace(state.IMAPAppPassword) != "" {
-			return domain.ICloudStatusActive
+		if state.LastCheckOK {
+			successes++
+		} else {
+			failures++
 		}
 	}
-	return domain.ICloudStatusNeedLogin
+	if successes > 0 {
+		if failures > 0 {
+			return domain.ICloudStatusPartial
+		}
+		return domain.ICloudStatusActive
+	}
+	if failures > 0 {
+		return domain.ICloudStatusFailed
+	}
+	if !session.LastCheckedAt.IsZero() {
+		if session.LastCheckOK {
+			return domain.ICloudStatusActive
+		}
+		return domain.ICloudStatusFailed
+	}
+	if session.IsICloudPlus && session.CanCreateHME {
+		return domain.ICloudStatusActive
+	}
+	if !session.IsICloudPlus {
+		return domain.ICloudStatusNoICloudPlus
+	}
+	return domain.ICloudStatusActive
 }
 
 func sameICloudSessionIdentity(left, right domain.ICloudSession) bool {
-	if left.AccountID != "" && left.AccountID == right.AccountID {
-		return true
+	if left.AccountID != "" && right.AccountID != "" {
+		return left.AccountID == right.AccountID
 	}
-	if left.DSID != "" && left.DSID == right.DSID {
-		return true
+	if left.DSID != "" && right.DSID != "" {
+		return left.DSID == right.DSID
 	}
-	return left.AppleID != "" && strings.EqualFold(left.AppleID, right.AppleID)
+	return strings.EqualFold(strings.TrimSpace(left.AppleID), strings.TrimSpace(right.AppleID))
 }
 
 func mergeICloudSession(existing, incoming domain.ICloudSession) domain.ICloudSession {
-	out := incoming
+	out := cloneICloudSession(incoming)
 	out.OwnerID = firstNonEmpty(incoming.OwnerID, existing.OwnerID)
 	out.AccountID = firstNonEmpty(incoming.AccountID, existing.AccountID)
 	if out.SavedAt.IsZero() {
@@ -289,8 +331,7 @@ func mergeICloudSession(existing, incoming domain.ICloudSession) domain.ICloudSe
 	out.Note = firstNonEmpty(incoming.Note, existing.Note)
 	if out.LastCheckedAt.IsZero() {
 		out.LastCheckedAt = existing.LastCheckedAt
-	}
-	if strings.TrimSpace(out.LastStatusMessage) == "" {
+		out.LastCheckOK = existing.LastCheckOK
 		out.LastStatusMessage = existing.LastStatusMessage
 	}
 	return out

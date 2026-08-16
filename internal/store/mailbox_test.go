@@ -10,7 +10,7 @@ import (
 )
 
 func TestSetMailboxStatusHandlesOptionalNote(t *testing.T) {
-	state, err := Open(filepath.Join(t.TempDir(), "state.json"))
+	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
 		t.Fatalf("创建临时状态失败：%v", err)
 	}
@@ -160,7 +160,7 @@ func TestMailboxLeaseNoteCanBeUpdated(t *testing.T) {
 
 func newLeaseTestStore(t *testing.T) (*Store, domain.Mailbox) {
 	t.Helper()
-	state, err := Open(filepath.Join(t.TempDir(), "state.json"))
+	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
 		t.Fatalf("创建临时状态失败：%v", err)
 	}

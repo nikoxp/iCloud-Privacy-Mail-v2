@@ -2,12 +2,11 @@ package store
 
 import (
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,29 +16,25 @@ import (
 )
 
 type Store struct {
-	mu    sync.RWMutex
-	path  string
-	state domain.State
+	mu             sync.RWMutex
+	path           string
+	db             *sql.DB
+	codec          *secretCodec
+	changes        *changeHub
+	changeLogLimit int
 }
 
 func Open(path string) (*Store, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		path = filepath.Join("data", "state.json")
+		path = filepath.Join("data", "app.db")
 	}
-	now := time.Now()
-	s := &Store{
-		path: path,
-		state: domain.State{
-			SchemaVersion:  domain.SchemaVersion,
-			NextID:         1,
-			Settings:       domain.DefaultSettings(),
-			CreateSettings: domain.DefaultCreateSettings(),
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		},
+	s := &Store{path: path, changes: newChangeHub(), changeLogLimit: defaultChangeLogLimit}
+	if err := s.openDatabase(); err != nil {
+		return nil, err
 	}
-	if err := s.load(); err != nil {
+	if err := s.initializeDatabase(); err != nil {
+		_ = s.Close()
 		return nil, err
 	}
 	return s, nil
@@ -49,101 +44,47 @@ func (s *Store) Path() string {
 	return s.path
 }
 
-func (s *Store) load() error {
+func (s *Store) initializeDatabase() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data, err := os.ReadFile(s.path)
+	tx, err := s.db.Begin()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return s.saveLocked()
-		}
 		return err
 	}
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return s.saveLocked()
+	now := time.Now()
+	if _, err := tx.Exec(`UPDATE metadata SET value = ? WHERE key = 'created_at' AND value = ''`, now.Format(time.RFC3339Nano)); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
-	if err := json.Unmarshal(data, &s.state); err != nil {
-		return fmt.Errorf("读取状态文件失败：%w", err)
+	if _, err := tx.Exec(`INSERT INTO metadata(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, strconv.Itoa(databaseSchemaVersion)); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
-	s.normalizeLocked()
-	return nil
-}
-
-func (s *Store) normalizeLocked() {
-	s.state.SchemaVersion = domain.SchemaVersion
-	s.migrateLegacyICloudSessionsLocked()
-	s.normalizeMailboxLeasesLocked(time.Now())
-	if s.state.NextID <= 0 {
-		s.state.NextID = 1
+	var settings domain.Settings
+	if found, err := s.readEntityTx(tx, "settings", "system", &settings); err != nil {
+		_ = tx.Rollback()
+		return err
+	} else if !found {
+		settings = domain.DefaultSettings()
 	}
-	s.ensureNextIDLocked()
-	if s.state.Settings.MailboxPageSize <= 0 {
-		s.state.Settings = domain.DefaultSettings()
+	settings.AppleAccountModuleReady = true
+	if _, _, err := s.upsertEntityTx(tx, "settings", "settings", "system", settings); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
-	// Apple 协议层已经完成迁移，旧状态文件载入后也应开放账号模块。
-	s.state.Settings.AppleAccountModuleReady = true
-	normalizeCreateSettings(&s.state.CreateSettings)
-	if s.state.CreatedAt.IsZero() {
-		s.state.CreatedAt = time.Now()
+	var createSettings domain.CreateSettings
+	if found, err := s.readEntityTx(tx, "create_settings", "system", &createSettings); err != nil {
+		_ = tx.Rollback()
+		return err
+	} else if !found {
+		createSettings = domain.DefaultCreateSettings()
 	}
-	if s.state.UpdatedAt.IsZero() {
-		s.state.UpdatedAt = s.state.CreatedAt
+	normalizeCreateSettings(&createSettings)
+	if _, _, err := s.upsertEntityTx(tx, "create_settings", "create-settings", "system", createSettings); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
-}
-
-func (s *Store) migrateLegacyICloudSessionsLocked() {
-	if len(s.state.ICloudSessions) > 0 {
-		return
-	}
-	rawStates := append([]json.RawMessage(nil), s.state.LegacyICloudStates...)
-	if len(s.state.LegacyICloudSession) > 0 && string(s.state.LegacyICloudSession) != "null" {
-		rawStates = append(rawStates, s.state.LegacyICloudSession)
-	}
-	for _, raw := range rawStates {
-		var session domain.ICloudSession
-		if err := json.Unmarshal(raw, &session); err == nil {
-			s.state.ICloudSessions = append(s.state.ICloudSessions, session)
-		}
-	}
-	if len(s.state.ICloudSessions) > 0 {
-		s.state.LegacyICloudSession = nil
-		s.state.LegacyICloudStates = nil
-	}
-}
-
-func (s *Store) ensureNextIDLocked() {
-	maxID := s.state.NextID - 1
-	consider := func(value string) {
-		index := strings.LastIndex(value, "_")
-		if index < 0 || index == len(value)-1 {
-			return
-		}
-		parsed, err := strconv.Atoi(value[index+1:])
-		if err == nil && parsed > maxID {
-			maxID = parsed
-		}
-	}
-	if s.state.Admin != nil {
-		consider(s.state.Admin.ID)
-	}
-	for _, account := range s.state.AppleAccounts {
-		consider(account.ID)
-	}
-	for _, mailbox := range s.state.Mailboxes {
-		consider(mailbox.ID)
-	}
-	for _, lease := range s.state.MailboxLeases {
-		consider(lease.ID)
-	}
-	for _, message := range s.state.Messages {
-		consider(message.ID)
-	}
-	for _, event := range s.state.Events {
-		consider(event.ID)
-	}
-	if s.state.NextID <= maxID {
-		s.state.NextID = maxID + 1
-	}
+	return s.commitTx(tx, nil)
 }
 
 func normalizeCreateSettings(settings *domain.CreateSettings) {
@@ -163,209 +104,280 @@ func normalizeCreateSettings(settings *domain.CreateSettings) {
 	if strings.TrimSpace(settings.ICloudWebTwoFactorMethod) == "" {
 		settings.ICloudWebTwoFactorMethod = defaults.ICloudWebTwoFactorMethod
 	}
-	if settings.SchedulerIntervalMinutes <= 0 {
-		settings.SchedulerIntervalMinutes = defaults.SchedulerIntervalMinutes
+	if settings.SchedulerIntervalMinMinutes <= 0 {
+		settings.SchedulerIntervalMinMinutes = defaults.SchedulerIntervalMinMinutes
 	}
-	if settings.SchedulerRoundIntervalSeconds <= 0 {
-		settings.SchedulerRoundIntervalSeconds = defaults.SchedulerRoundIntervalSeconds
+	if settings.SchedulerIntervalMaxMinutes <= 0 {
+		settings.SchedulerIntervalMaxMinutes = settings.SchedulerIntervalMinMinutes
 	}
-	if settings.MailboxPageSize <= 0 {
-		settings.MailboxPageSize = defaults.MailboxPageSize
+	if settings.SchedulerIntervalMinMinutes > settings.SchedulerIntervalMaxMinutes {
+		settings.SchedulerIntervalMinMinutes, settings.SchedulerIntervalMaxMinutes = settings.SchedulerIntervalMaxMinutes, settings.SchedulerIntervalMinMinutes
+	}
+	if settings.SchedulerAccountIntervalMinSeconds <= 0 {
+		settings.SchedulerAccountIntervalMinSeconds = defaults.SchedulerAccountIntervalMinSeconds
+	}
+	if settings.SchedulerAccountIntervalMaxSeconds <= 0 {
+		settings.SchedulerAccountIntervalMaxSeconds = settings.SchedulerAccountIntervalMinSeconds
+	}
+	if settings.SchedulerAccountIntervalMinSeconds > settings.SchedulerAccountIntervalMaxSeconds {
+		settings.SchedulerAccountIntervalMinSeconds, settings.SchedulerAccountIntervalMaxSeconds = settings.SchedulerAccountIntervalMaxSeconds, settings.SchedulerAccountIntervalMinSeconds
 	}
 }
 
-// NextMailboxLabel 根据本地已有邮箱标签生成下一个连续编号。
-func (s *Store) NextMailboxLabel(prefix string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		prefix = domain.DefaultCreateSettings().Label
+func (s *Store) loadEntities(table, order string, target any) error {
+	query := `SELECT data_json FROM ` + table
+	if strings.TrimSpace(order) != "" {
+		query += ` ORDER BY ` + order
 	}
-	marker := prefix + "_"
-	maxNumber := 0
-	for _, mailbox := range s.state.Mailboxes {
-		label := strings.TrimSpace(mailbox.Label)
-		if len(label) <= len(marker) || !strings.EqualFold(label[:len(marker)], marker) {
-			continue
-		}
-		number, err := strconv.Atoi(label[len(marker):])
-		if err == nil && number > maxNumber {
-			maxNumber = number
-		}
-	}
-	return fmt.Sprintf("%s_%d", prefix, maxNumber+1)
-}
-
-func (s *Store) saveLocked() error {
-	s.state.SchemaVersion = domain.SchemaVersion
-	s.state.UpdatedAt = time.Now()
-	data, err := json.MarshalIndent(s.state, "", "  ")
+	rows, err := s.db.Query(query)
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	defer rows.Close()
+	items := make([]json.RawMessage, 0)
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			return err
+		}
+		plain, err := s.unprotectJSON(table, data)
+		if err != nil {
+			return err
+		}
+		items = append(items, plain)
+	}
+	if err := rows.Err(); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
+	data, err := json.Marshal(items)
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, s.path)
+	return json.Unmarshal(data, target)
 }
 
+// Snapshot 从 SQLite 组装导出快照，不保留运行期全量状态缓存。
 func (s *Store) Snapshot() domain.State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	data, _ := json.Marshal(s.state)
-	var out domain.State
-	_ = json.Unmarshal(data, &out)
-	return out
+	state := domain.State{SchemaVersion: domain.SchemaVersion, Settings: domain.DefaultSettings(), CreateSettings: domain.DefaultCreateSettings()}
+	_ = s.loadEntities("apple_accounts", `json_extract(data_json, '$.created_at')`, &state.AppleAccounts)
+	_ = s.loadEntities("mailboxes", `json_extract(data_json, '$.created_at')`, &state.Mailboxes)
+	_ = s.loadEntities("mailbox_leases", `json_extract(data_json, '$.created_at')`, &state.MailboxLeases)
+	_ = s.loadEntities("messages", `json_extract(data_json, '$.received_at')`, &state.Messages)
+	_ = s.loadEntities("events", `json_extract(data_json, '$.created_at')`, &state.Events)
+	_ = s.loadEntities("web_sessions", `json_extract(data_json, '$.created_at')`, &state.Sessions)
+	_ = s.loadEntities("icloud_sessions", `json_extract(data_json, '$.saved_at')`, &state.ICloudSessions)
+	_, _ = s.readEntity("settings", "system", &state.Settings)
+	_, _ = s.readEntity("create_settings", "system", &state.CreateSettings)
+	var admins []domain.Admin
+	_ = s.loadEntities("admins", `json_extract(data_json, '$.created_at')`, &admins)
+	if len(admins) > 0 {
+		state.Admin = &admins[0]
+	}
+	var rawNext, createdAt, updatedAt string
+	_ = s.db.QueryRow(`SELECT value FROM metadata WHERE key = 'next_id'`).Scan(&rawNext)
+	_ = s.db.QueryRow(`SELECT value FROM metadata WHERE key = 'created_at'`).Scan(&createdAt)
+	_ = s.db.QueryRow(`SELECT value FROM metadata WHERE key = 'updated_at'`).Scan(&updatedAt)
+	state.NextID, _ = strconv.Atoi(rawNext)
+	state.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	state.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return state
 }
 
 func (s *Store) SetupAdmin(username, passwordHash string) (domain.Admin, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state.Admin != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return domain.Admin{}, err
+	}
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM admins`).Scan(&count); err != nil {
+		_ = tx.Rollback()
+		return domain.Admin{}, err
+	}
+	if count > 0 {
+		_ = tx.Rollback()
 		return domain.Admin{}, errors.New("管理员已经初始化")
 	}
-	now := time.Now()
-	admin := domain.Admin{
-		ID:           s.nextIDLocked("admin"),
-		Username:     strings.ToLower(strings.TrimSpace(username)),
-		PasswordHash: passwordHash,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+	id, err := s.nextIDTx(tx, "admin")
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.Admin{}, err
 	}
-	s.state.Admin = &admin
-	s.appendEventLocked("info", "auth", "已完成单管理员初始化")
-	return admin, s.saveLocked()
+	now := time.Now()
+	admin := domain.Admin{ID: id, Username: strings.ToLower(strings.TrimSpace(username)), PasswordHash: passwordHash, CreatedAt: now, UpdatedAt: now}
+	change, _, err := s.upsertEntityTx(tx, "admins", "admin", admin.ID, admin)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.Admin{}, err
+	}
+	eventChange, err := s.appendEventTx(tx, "info", "auth", "已完成单管理员初始化")
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.Admin{}, err
+	}
+	return admin, s.commitTx(tx, []Change{change, eventChange})
 }
 
 func (s *Store) Admin() (domain.Admin, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.state.Admin == nil {
+	var admin domain.Admin
+	var data []byte
+	err := s.db.QueryRow(`SELECT data_json FROM admins ORDER BY json_extract(data_json, '$.created_at') LIMIT 1`).Scan(&data)
+	if err != nil || s.decodeEntity("admins", data, &admin) != nil {
 		return domain.Admin{}, false
 	}
-	return *s.state.Admin, true
+	return admin, true
 }
 
 func (s *Store) MarkLogin() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state.Admin == nil {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	var admin domain.Admin
+	var data []byte
+	if err := tx.QueryRow(`SELECT data_json FROM admins LIMIT 1`).Scan(&data); err != nil {
+		_ = tx.Rollback()
 		return errors.New("管理员尚未初始化")
 	}
+	if err := s.decodeEntity("admins", data, &admin); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	now := time.Now()
-	s.state.Admin.LastLoginAt = now
-	s.state.Admin.UpdatedAt = now
-	s.appendEventLocked("info", "auth", "管理员已登录")
-	return s.saveLocked()
+	admin.LastLoginAt, admin.UpdatedAt = now, now
+	adminChange, _, err := s.upsertEntityTx(tx, "admins", "admin", admin.ID, admin)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	eventChange, err := s.appendEventTx(tx, "info", "auth", "管理员已登录")
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return s.commitTx(tx, []Change{adminChange, eventChange})
 }
 
 func (s *Store) SaveSession(tokenHash string, expiresAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now()
-	filtered := s.state.Sessions[:0]
-	for _, session := range s.state.Sessions {
-		if session.ExpiresAt.After(now) {
-			filtered = append(filtered, session)
-		}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	s.state.Sessions = append(filtered, domain.WebSession{
-		TokenHash:  tokenHash,
-		CreatedAt:  now,
-		LastSeenAt: now,
-		ExpiresAt:  expiresAt,
-	})
-	return s.saveLocked()
+	now := time.Now()
+	if _, err := tx.Exec(`DELETE FROM web_sessions WHERE json_extract(data_json, '$.expires_at') <= ?`, now.Format(time.RFC3339Nano)); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	session := domain.WebSession{TokenHash: tokenHash, CreatedAt: now, LastSeenAt: now, ExpiresAt: expiresAt}
+	change, _, err := s.upsertEntityTx(tx, "web_sessions", "web-session", tokenHash, session)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return s.commitTx(tx, []Change{change})
 }
 
 func (s *Store) ValidateSession(tokenHash string) (domain.Admin, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state.Admin == nil || strings.TrimSpace(tokenHash) == "" {
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
 		return domain.Admin{}, false
 	}
-	now := time.Now()
-	for i := range s.state.Sessions {
-		session := &s.state.Sessions[i]
-		if session.ExpiresAt.Before(now) {
-			continue
-		}
-		if constantTimeEqual(session.TokenHash, tokenHash) {
-			session.LastSeenAt = now
-			return *s.state.Admin, true
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var session domain.WebSession
+	if found, err := s.readEntity("web_sessions", tokenHash, &session); err != nil || !found || !session.ExpiresAt.After(time.Now()) {
+		return domain.Admin{}, false
+	}
+	var admin domain.Admin
+	var data []byte
+	if err := s.db.QueryRow(`SELECT data_json FROM admins LIMIT 1`).Scan(&data); err != nil || s.decodeEntity("admins", data, &admin) != nil {
+		return domain.Admin{}, false
+	}
+	if !constantTimeEqual(session.TokenHash, tokenHash) {
+		return domain.Admin{}, false
+	}
+	// 最近访问时间最多每十分钟持久化一次，并且不作为前端业务变更广播。
+	if time.Since(session.LastSeenAt) >= 10*time.Minute {
+		session.LastSeenAt = time.Now()
+		if tx, err := s.db.Begin(); err == nil {
+			if _, changed, saveErr := s.upsertEntityTx(tx, "web_sessions", "web-session", tokenHash, session); saveErr == nil && changed {
+				_ = s.commitTx(tx, nil)
+			} else {
+				_ = tx.Rollback()
+			}
 		}
 	}
-	return domain.Admin{}, false
+	return admin, true
 }
 
 func (s *Store) DeleteSession(tokenHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	filtered := s.state.Sessions[:0]
-	for _, session := range s.state.Sessions {
-		if !constantTimeEqual(session.TokenHash, tokenHash) {
-			filtered = append(filtered, session)
-		}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	s.state.Sessions = filtered
-	return s.saveLocked()
+	change, changed, err := s.deleteEntityTx(tx, "web_sessions", "web-session", tokenHash)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if !changed {
+		_ = tx.Rollback()
+		return nil
+	}
+	return s.commitTx(tx, []Change{change})
 }
 
 func (s *Store) Dashboard() domain.Dashboard {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := domain.Dashboard{
-		AppleAccountCount: len(s.state.AppleAccounts),
-		MailboxCount:      len(s.state.Mailboxes),
-		MessageCount:      len(s.state.Messages),
-	}
-	for _, account := range s.state.AppleAccounts {
-		if strings.EqualFold(account.Status, "active") || strings.EqualFold(account.ICloudStatus, "active") {
-			out.ActiveAccountCount++
+	out := domain.Dashboard{}
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM apple_accounts`).Scan(&out.AppleAccountCount)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM apple_accounts WHERE lower(json_extract(data_json, '$.status')) = 'active' OR lower(json_extract(data_json, '$.icloud_status')) = 'active'`).Scan(&out.ActiveAccountCount)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM mailboxes`).Scan(&out.MailboxCount)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM mailboxes WHERE json_extract(data_json, '$.api_active') = 1 AND json_extract(data_json, '$.icloud_active') = 1 AND lower(json_extract(data_json, '$.status')) = 'available'`).Scan(&out.AvailableCount)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&out.MessageCount)
+	rows, err := s.db.Query(`SELECT data_json FROM events ORDER BY json_extract(data_json, '$.created_at') DESC LIMIT 30`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var data []byte
+			var event domain.Event
+			if rows.Scan(&data) == nil && s.decodeEntity("events", data, &event) == nil {
+				out.Events = append(out.Events, event)
+			}
 		}
 	}
-	for _, mailbox := range s.state.Mailboxes {
-		if mailbox.APIActive && mailbox.ICloudActive && strings.EqualFold(mailbox.Status, "available") {
-			out.AvailableCount++
-		}
-	}
-	start := 0
-	if len(s.state.Events) > 30 {
-		start = len(s.state.Events) - 30
-	}
-	out.Events = append([]domain.Event(nil), s.state.Events[start:]...)
-	sort.Slice(out.Events, func(i, j int) bool { return out.Events[i].CreatedAt.After(out.Events[j].CreatedAt) })
 	return out
 }
 
 func (s *Store) AppleAccounts() []domain.AppleAccount {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := append([]domain.AppleAccount(nil), s.state.AppleAccounts...)
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	var out []domain.AppleAccount
+	_ = s.loadEntities("apple_accounts", `json_extract(data_json, '$.created_at') DESC`, &out)
+	var sessions []domain.ICloudSession
+	if err := s.loadEntities("icloud_sessions", "", &sessions); err == nil {
+		byAccount := make(map[string]domain.ICloudSession, len(sessions))
+		for _, session := range sessions {
+			byAccount[session.AccountID] = session
+		}
+		for index := range out {
+			if session, ok := byAccount[out[index].ID]; ok {
+				out[index].ICloudStatus = iCloudStatusFromSession(session)
+			}
+		}
+	}
 	return out
 }
 
@@ -379,30 +391,28 @@ func (s *Store) Mailboxes(query, status, accountID string, page, pageSize int) d
 		page = 1
 	}
 	if pageSize <= 0 {
-		pageSize = s.state.Settings.MailboxPageSize
-	}
-	if pageSize <= 0 {
-		pageSize = domain.DefaultSettings().MailboxPageSize
+		pageSize = 7
 	}
 	if pageSize > 200 {
 		pageSize = 200
 	}
-	items := make([]domain.Mailbox, 0, len(s.state.Mailboxes))
-	for _, mailbox := range s.state.Mailboxes {
-		if accountID != "" && mailbox.AccountID != accountID {
-			continue
-		}
-		if status != "" && !strings.EqualFold(mailbox.Status, status) {
-			continue
-		}
-		if query != "" && !strings.Contains(strings.ToLower(mailbox.Email+" "+mailbox.Label+" "+mailbox.Note), query) {
-			continue
-		}
-		mailbox.APIToken = ""
-		items = append(items, mailbox)
+	where := []string{"1 = 1"}
+	args := []any{}
+	if accountID != "" {
+		where = append(where, `json_extract(data_json, '$.account_id') = ?`)
+		args = append(args, accountID)
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.After(items[j].CreatedAt) })
-	total := len(items)
+	if status != "" {
+		where = append(where, `lower(json_extract(data_json, '$.status')) = ?`)
+		args = append(args, status)
+	}
+	if query != "" {
+		where = append(where, `lower(COALESCE(json_extract(data_json, '$.email'), '') || ' ' || COALESCE(json_extract(data_json, '$.label'), '') || ' ' || COALESCE(json_extract(data_json, '$.note'), '')) LIKE ?`)
+		args = append(args, "%"+query+"%")
+	}
+	clause := strings.Join(where, " AND ")
+	var total int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM mailboxes WHERE `+clause, args...).Scan(&total)
 	totalPages := (total + pageSize - 1) / pageSize
 	if totalPages == 0 {
 		totalPages = 1
@@ -410,35 +420,41 @@ func (s *Store) Mailboxes(query, status, accountID string, page, pageSize int) d
 	if page > totalPages {
 		page = totalPages
 	}
-	start := (page - 1) * pageSize
-	end := start + pageSize
-	if start > total {
-		start = total
+	queryArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
+	rows, err := s.db.Query(`SELECT data_json FROM mailboxes WHERE `+clause+` ORDER BY json_extract(data_json, '$.created_at') DESC LIMIT ? OFFSET ?`, queryArgs...)
+	items := make([]domain.Mailbox, 0, pageSize)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var data []byte
+			var mailbox domain.Mailbox
+			if rows.Scan(&data) == nil && s.decodeEntity("mailboxes", data, &mailbox) == nil {
+				mailbox.APIToken = ""
+				items = append(items, mailbox)
+			}
+		}
 	}
-	if end > total {
-		end = total
-	}
-	return domain.MailboxPage{
-		Items:      append([]domain.Mailbox(nil), items[start:end]...),
-		Page:       page,
-		PageSize:   pageSize,
-		Total:      total,
-		TotalPages: totalPages,
-	}
+	return domain.MailboxPage{Items: items, Page: page, PageSize: pageSize, Total: total, TotalPages: totalPages}
 }
 
 func (s *Store) Settings() domain.Settings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.state.Settings
+	settings := domain.DefaultSettings()
+	_, _ = s.readEntity("settings", "system", &settings)
+	return settings
 }
 
 func (s *Store) CreateSettings() domain.CreateSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := s.state.CreateSettings
-	out.AccountIDs = append([]string(nil), out.AccountIDs...)
-	return out
+	var settings domain.CreateSettings
+	if found, _ := s.readEntity("create_settings", "system", &settings); !found {
+		settings = domain.DefaultCreateSettings()
+	}
+	normalizeCreateSettings(&settings)
+	settings.AccountIDs = append([]string(nil), settings.AccountIDs...)
+	return settings
 }
 
 func (s *Store) SaveCreateSettings(settings domain.CreateSettings) (domain.CreateSettings, error) {
@@ -446,52 +462,66 @@ func (s *Store) SaveCreateSettings(settings domain.CreateSettings) (domain.Creat
 	defer s.mu.Unlock()
 	normalizeCreateSettings(&settings)
 	settings.UpdatedAt = time.Now()
-	s.state.CreateSettings = settings
-	s.appendEventLocked("info", "settings", "已保存邮箱创建设置")
-	return settings, s.saveLocked()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return domain.CreateSettings{}, err
+	}
+	change, _, err := s.upsertEntityTx(tx, "create_settings", "create-settings", "system", settings)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.CreateSettings{}, err
+	}
+	eventChange, err := s.appendEventTx(tx, "info", "settings", "已保存邮箱创建设置")
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.CreateSettings{}, err
+	}
+	return settings, s.commitTx(tx, []Change{change, eventChange})
 }
 
 func (s *Store) ICloudSessions() []domain.ICloudSession {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	data, _ := json.Marshal(s.state.ICloudSessions)
-	var out []domain.ICloudSession
-	_ = json.Unmarshal(data, &out)
-	return out
+	var sessions []domain.ICloudSession
+	_ = s.loadEntities("icloud_sessions", `json_extract(data_json, '$.saved_at') DESC`, &sessions)
+	return sessions
 }
 
 func (s *Store) SaveSettings(settings domain.Settings) (domain.Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	settings.PublicAPIKey = strings.TrimSpace(settings.PublicAPIKey)
-	if settings.MailboxPageSize <= 0 {
-		settings.MailboxPageSize = domain.DefaultSettings().MailboxPageSize
-	}
-	if settings.MailboxPageSize > 200 {
-		settings.MailboxPageSize = 200
-	}
-	// Apple 模块由后端能力决定，不允许通过页面关闭。
 	settings.AppleAccountModuleReady = true
-	s.state.Settings = settings
-	s.appendEventLocked("info", "settings", "已保存系统设置")
-	return settings, s.saveLocked()
-}
-
-func (s *Store) ReplaceState(state domain.State) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.state = state
-	s.normalizeLocked()
-	s.state.Sessions = nil
-	s.appendEventLocked("info", "migration", "已从旧项目导入数据")
-	return s.saveLocked()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return domain.Settings{}, err
+	}
+	change, _, err := s.upsertEntityTx(tx, "settings", "settings", "system", settings)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.Settings{}, err
+	}
+	eventChange, err := s.appendEventTx(tx, "info", "settings", "已保存系统设置")
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.Settings{}, err
+	}
+	return settings, s.commitTx(tx, []Change{change, eventChange})
 }
 
 func (s *Store) ClearEvents() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state.Events = nil
-	return s.saveLocked()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM events`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	change := makeEntityChange("events", "event", "all", "deleted", nil, time.Now())
+	return s.commitTx(tx, []Change{change})
 }
 
 func (s *Store) RecordEvent(level, category, message string) error {
@@ -499,37 +529,69 @@ func (s *Store) RecordEvent(level, category, message string) error {
 	if message == "" {
 		return nil
 	}
-	level = strings.TrimSpace(level)
-	if level == "" {
+	if level = strings.TrimSpace(level); level == "" {
 		level = "info"
 	}
-	category = strings.TrimSpace(category)
-	if category == "" {
+	if category = strings.TrimSpace(category); category == "" {
 		category = "system"
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.appendEventLocked(level, category, message)
-	return s.saveLocked()
-}
-
-func (s *Store) nextIDLocked(prefix string) string {
-	id := fmt.Sprintf("%s_%06d", prefix, s.state.NextID)
-	s.state.NextID++
-	return id
-}
-
-func (s *Store) appendEventLocked(level, category, message string) {
-	s.state.Events = append(s.state.Events, domain.Event{
-		ID:        s.nextIDLocked("evt"),
-		Level:     level,
-		Category:  category,
-		Message:   message,
-		CreatedAt: time.Now(),
-	})
-	if len(s.state.Events) > 500 {
-		s.state.Events = append([]domain.Event(nil), s.state.Events[len(s.state.Events)-500:]...)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
+	change, err := s.appendEventTx(tx, level, category, message)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return s.commitTx(tx, []Change{change})
+}
+
+func (s *Store) appendEventTx(tx *sql.Tx, level, category, message string) (Change, error) {
+	id, err := s.nextIDTx(tx, "evt")
+	if err != nil {
+		return Change{}, err
+	}
+	event := domain.Event{ID: id, Level: level, Category: category, Message: message, CreatedAt: time.Now()}
+	change, _, err := s.upsertEntityTx(tx, "events", "event", id, event)
+	if err != nil {
+		return Change{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM events WHERE id IN (
+		SELECT id FROM events ORDER BY json_extract(data_json, '$.created_at') DESC LIMIT -1 OFFSET 500
+	)`); err != nil {
+		return Change{}, err
+	}
+	return change, nil
+}
+
+func (s *Store) NextMailboxLabel(prefix string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = domain.DefaultCreateSettings().Label
+	}
+	rows, err := s.db.Query(`SELECT json_extract(data_json, '$.label') FROM mailboxes WHERE json_extract(data_json, '$.label') LIKE ?`, prefix+"_%")
+	if err != nil {
+		return prefix + "_1"
+	}
+	defer rows.Close()
+	maxNumber := 0
+	marker := prefix + "_"
+	for rows.Next() {
+		var label string
+		if rows.Scan(&label) != nil || !strings.HasPrefix(strings.ToLower(label), strings.ToLower(marker)) {
+			continue
+		}
+		number, err := strconv.Atoi(label[len(marker):])
+		if err == nil && number > maxNumber {
+			maxNumber = number
+		}
+	}
+	return fmt.Sprintf("%s_%d", prefix, maxNumber+1)
 }
 
 func constantTimeEqual(candidate, expected string) bool {
