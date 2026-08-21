@@ -2762,6 +2762,27 @@ textarea.field {
   scrollbar-gutter: stable;
 }
 
+.public-code-message-list {
+  height: auto;
+  max-height: 466px;
+  min-height: 52px;
+}
+
+.public-code-message-list .mail-message-row {
+  min-height: 58px;
+  padding: 7px 10px;
+}
+
+.public-code-message-state {
+  min-height: 498px;
+}
+
+@media (max-width: 639px) {
+  .public-code-message-state {
+    min-height: 490px;
+  }
+}
+
 .mail-message-dialog {
   width: min(920px, calc(100vw - 1.5rem));
   height: min(760px, calc(100vh - 1.5rem));

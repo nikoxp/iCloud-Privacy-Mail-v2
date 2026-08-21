@@ -50,7 +50,7 @@
 - `/tasks`：单次/自动创建、随机范围设置、任务概览和调度日志。
 - `/exports`：运行数据、邮件、邮箱和取码 API 导出。
 - `/settings`：SQLite 维护、公共访问、后台能力、API Key 和版本检查。
-- `/verification-code`：公共验证码页面。
+- `/email-code`：公共邮箱取码与邮件查看页面。
 
 新版截图位于 `docs/screenshots/ui/`，使用隔离演示数据采集。
 

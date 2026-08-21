@@ -1015,11 +1015,23 @@ func (s *Service) findCode(mailbox domain.Mailbox, query CodeQuery) (CodeResult,
 	if keyword == "" {
 		keyword = "OpenAI"
 	}
-	after := codeAfter(query.After, time.Now())
 	skipMessageID := strings.TrimSpace(query.SkipMessageID)
 	if query.IncludeServed {
 		skipMessageID = ""
 	}
+	after := query.After
+	if skipMessageID != "" {
+		if servedMessage, ok := s.store.FindMessageForMailbox(mailbox.ID, skipMessageID); ok {
+			servedAt := servedMessage.ReceivedAt
+			if servedAt.IsZero() {
+				servedAt = servedMessage.CreatedAt
+			}
+			if !servedAt.IsZero() && !servedAt.Before(after) {
+				after = servedAt.Add(time.Nanosecond)
+			}
+		}
+	}
+	after = codeAfter(after, time.Now())
 	for _, message := range s.store.MessagesForMailbox(mailbox.ID) {
 		messageTime := message.ReceivedAt
 		if messageTime.IsZero() {

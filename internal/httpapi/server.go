@@ -98,6 +98,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/mailbox-leases/{lease_id}/note", s.handlePublicMailboxLeaseNote)
 	s.mux.HandleFunc("GET /api/v1/public-code/status", s.handlePublicCodePageStatus)
 	s.mux.HandleFunc("GET /api/v1/public-code", s.handlePublicCodePageLookup)
+	s.mux.HandleFunc("GET /api/v1/public-code/messages", s.handlePublicCodePageMessages)
+	s.mux.HandleFunc("GET /api/v1/public-code/messages/{messageID}", s.handlePublicCodePageMessage)
 	s.mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	s.mux.HandleFunc("POST /api/auth/setup", s.handleAuthSetup)
 	s.mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
