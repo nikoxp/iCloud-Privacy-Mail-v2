@@ -124,6 +124,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/mailboxes/{id}/remote-clean", s.protected(s.handleMailboxRemoteClean))
 	s.mux.HandleFunc("DELETE /api/mailboxes/{id}", s.protected(s.handleMailboxDelete))
 	s.mux.HandleFunc("GET /api/mailboxes/{id}/messages", s.protected(s.handleMailboxMessages))
+	s.mux.HandleFunc("GET /api/mailboxes/{id}/messages/{messageID}", s.protected(s.handleMailboxMessage))
 	s.mux.HandleFunc("GET /api/mailboxes/{id}/code", s.protected(s.handleMailboxCode))
 	s.mux.HandleFunc("GET /api/tasks", s.protected(s.handleTasks))
 	s.mux.HandleFunc("GET /api/settings", s.protected(s.handleSettings))
@@ -160,12 +161,27 @@ func (s *Server) StartBackground(ctx context.Context) {
 	s.scheduler.Resume(ctx)
 	go s.runMailboxLeaseReaper(ctx)
 	go s.runDatabaseMaintenance(ctx)
+	go s.runMessageContentBackfill(ctx)
 	if s.cfg.AppleAccountKeepAliveEnabled {
 		go s.runAppleKeepAlive(ctx)
 	}
 	if s.cfg.MailWatcherEnabled {
 		go s.watcher.Run(ctx)
 	}
+}
+
+func (s *Server) runMessageContentBackfill(ctx context.Context) {
+	result, err := s.mailbox.BackfillMessageContent(ctx)
+	if result.Total == 0 {
+		return
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("旧邮件完整正文补全未全部完成", "总数", result.Total, "已补全", result.Updated, "失败", result.Failed, "错误", err)
+		}
+		return
+	}
+	s.log.Info("旧邮件完整正文补全完成", "总数", result.Total, "已补全", result.Updated)
 }
 
 func (s *Server) runMailboxLeaseReaper(ctx context.Context) {
@@ -811,6 +827,15 @@ func (s *Server) handleMailboxMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	items := s.store.MessagesForMailbox(r.PathValue("id"))
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"items": items}})
+}
+
+func (s *Server) handleMailboxMessage(w http.ResponseWriter, r *http.Request) {
+	message, err := s.mailbox.MessageContent(r.Context(), r.PathValue("id"), r.PathValue("messageID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"message": message}})
 }
 
 func (s *Server) handleMailboxCode(w http.ResponseWriter, r *http.Request) {

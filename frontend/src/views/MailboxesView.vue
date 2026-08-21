@@ -20,6 +20,8 @@ const pageSize = ref(7)
 const result = ref({ items: [], page: 1, page_size: 7, total: 0, total_pages: 1 })
 const selected = ref(null)
 const selectedMessage = ref(null)
+const selectedMessageLoading = ref(false)
+const messageViewMode = ref('auto')
 const messages = ref([])
 const code = ref(null)
 const codeMailbox = ref(null)
@@ -57,6 +59,7 @@ const pendingRealtimeResources = new Set()
 let tableResizeTimer
 let mailboxLayoutObserver
 let loadRequestID = 0
+let messageLoadRequestID = 0
 let deleteQueueRunning = false
 let autoRefreshing = false
 let deleteNoticeID = null
@@ -85,6 +88,7 @@ const mailboxDetailStatusOptions = [
   { value: 'disabled', label: '已停用', dot: 'bg-slate-500' },
 ]
 const accountOptions = computed(() => accounts.value.map((account) => ({ value: account.id, label: account.label || account.apple_id || account.id })))
+const accountByID = computed(() => new Map(accounts.value.map((account) => [account.id, account])))
 const accountFilterOptions = computed(() => [
   { value: '', label: '全部 Apple 账号', description: '显示所有账号创建的邮箱', dot: 'bg-slate-400' },
   ...accounts.value.map((account) => ({
@@ -102,9 +106,24 @@ const selectedDeletableCount = computed(() => selectedMailboxes.value.filter((ma
 const selectedPageCount = computed(() => (result.value.items || []).filter((mailbox) => selectedMailboxIDs.value.includes(mailbox.id)).length)
 const allPageMailboxesSelected = computed(() => Boolean(result.value.items?.length) && selectedPageCount.value === result.value.items.length)
 const somePageMailboxesSelected = computed(() => selectedPageCount.value > 0 && !allPageMailboxesSelected.value)
+const selectedMessageHasHTML = computed(() => Boolean(
+  String(selectedMessage.value?.html_body || '').trim()
+  || (String(selectedMessage.value?.content_type || '').toLowerCase().includes('text/html') && looksLikeHTML(selectedMessage.value?.body)),
+))
+const selectedMessageHTML = computed(() => {
+  if (!selectedMessage.value) return ''
+  return String(selectedMessage.value.html_body || (looksLikeHTML(selectedMessage.value.body) ? selectedMessage.value.body : '')).trim()
+})
+const selectedMessageHTMLDocument = computed(() => buildEmailHTMLDocument(selectedMessageHTML.value))
+const showSelectedMessageHTML = computed(() => selectedMessageHasHTML.value && messageViewMode.value !== 'text')
 
 function statusLabel(value) {
   return ({ available: '可用', reserved: '已预留', used: '已使用', failed: '失败', disabled: '已停用', active: '活跃' })[value] || value || '未知'
+}
+
+function mailboxAppleAccount(mailbox) {
+  const account = accountByID.value.get(mailbox?.account_id)
+  return account?.apple_id || account?.label || mailbox?.account_id || '—'
 }
 
 function statusClass(value) {
@@ -256,6 +275,91 @@ function formatMessageTime(value) {
   return sameDay
     ? date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
     : date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function looksLikeHTML(value) {
+  return /<(?:!doctype|html|head|body|style|table|div|p|a|img|span)\b/i.test(String(value || ''))
+}
+
+function messageContentTypeLabel(message) {
+  const contentType = String(message?.content_type || '').toLowerCase()
+  if (String(message?.html_body || '').trim() || contentType.includes('text/html') || looksLikeHTML(message?.body)) return 'HTML 邮件'
+  if (contentType.includes('text/plain')) return '纯文本邮件'
+  return '邮件正文'
+}
+
+function shrinkEmailFontSizes(value) {
+  return String(value || '').replace(/(font-size\s*:\s*)(\d+(?:\.\d+)?)px/gi, (match, prefix, rawSize) => {
+    const size = Number(rawSize)
+    if (!Number.isFinite(size) || size < 12) return match
+    const reducedSize = Math.max(11, Math.round(size * 0.82))
+    return `${prefix}${reducedSize}px`
+  })
+}
+
+function buildEmailHTMLDocument(value) {
+  if (!value || typeof DOMParser === 'undefined') return ''
+  const documentNode = new DOMParser().parseFromString(value, 'text/html')
+  documentNode.querySelectorAll('script, iframe, object, embed, form, input, button, textarea, select, base, meta[http-equiv="refresh"]').forEach((element) => element.remove())
+  documentNode.querySelectorAll('*').forEach((element) => {
+    for (const attribute of [...element.attributes]) {
+      const name = attribute.name.toLowerCase()
+      const attributeValue = attribute.value.trim().toLowerCase()
+      if (name.startsWith('on') || ((name === 'href' || name === 'src' || name === 'action') && attributeValue.startsWith('javascript:'))) {
+        element.removeAttribute(attribute.name)
+      }
+    }
+  })
+  documentNode.querySelectorAll('a[href]').forEach((link) => {
+    link.setAttribute('target', '_blank')
+    link.setAttribute('rel', 'noopener noreferrer')
+  })
+  // 只调整用于展示的副本，保留数据库中的原始邮件 HTML。
+  documentNode.querySelectorAll('style').forEach((element) => {
+    element.textContent = shrinkEmailFontSizes(element.textContent)
+  })
+  documentNode.querySelectorAll('[style]').forEach((element) => {
+    element.setAttribute('style', shrinkEmailFontSizes(element.getAttribute('style')))
+  })
+  const policy = documentNode.createElement('meta')
+  policy.setAttribute('http-equiv', 'Content-Security-Policy')
+  policy.setAttribute('content', "default-src 'none'; img-src https: http: data:; style-src 'unsafe-inline' https: http:; font-src https: http: data:; media-src https: http: data:; script-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'")
+  const viewport = documentNode.createElement('meta')
+  viewport.setAttribute('name', 'viewport')
+  viewport.setAttribute('content', 'width=device-width, initial-scale=1')
+  const readerStyle = documentNode.createElement('style')
+  readerStyle.textContent = 'html{color-scheme:light;background:#fff;scrollbar-width:thin;scrollbar-color:#cbd5e1 transparent}body{box-sizing:border-box;min-height:100%;margin:0;padding:24px;color:#172033;background:#fff;font-size:13px;overflow-wrap:anywhere}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{border:2px solid transparent;border-radius:9999px;background:#cbd5e1;background-clip:content-box}img{max-width:100%;height:auto}table{max-width:100%}pre{white-space:pre-wrap}a{color:#0a6cff}'
+  documentNode.head.prepend(policy, viewport, readerStyle)
+  return `<!doctype html>\n${documentNode.documentElement.outerHTML}`
+}
+
+async function openMessage(item) {
+  if (!item || !selected.value?.id) return
+  const requestID = ++messageLoadRequestID
+  selectedMessage.value = item
+  messageViewMode.value = selectedMessageHasHTML.value ? 'html' : 'text'
+  selectedMessageLoading.value = true
+  try {
+    const data = await api(`/api/mailboxes/${selected.value.id}/messages/${item.id}`)
+    if (requestID !== messageLoadRequestID || selectedMessage.value?.id !== item.id) return
+    const detail = data.message || item
+    selectedMessage.value = detail
+    messageViewMode.value = selectedMessageHasHTML.value ? 'html' : 'text'
+    messages.value = messages.value.map((message) => message.id === detail.id ? detail : message)
+  } catch (err) {
+    if (requestID === messageLoadRequestID && selectedMessage.value?.id === item.id) {
+      flash(`完整邮件加载失败：${err.message}`, true)
+    }
+  } finally {
+    if (requestID === messageLoadRequestID) selectedMessageLoading.value = false
+  }
+}
+
+function closeSelectedMessage() {
+  messageLoadRequestID++
+  selectedMessageLoading.value = false
+  selectedMessage.value = null
+  messageViewMode.value = 'auto'
 }
 
 function cleanupText(cleanup) {
@@ -1073,11 +1177,12 @@ onBeforeUnmount(() => {
       <div v-if="loadingVisible" class="mailbox-loading-mask"><div><LoaderCircle :size="16" class="animate-spin" />正在加载邮箱</div></div>
       <div ref="mailboxTableViewport" class="mailbox-table-viewport" :style="{ '--mailbox-table-height': `${mailboxTableHeight}px`, '--mailbox-empty-height': `${mailboxEmptyHeight}px` }">
         <table class="mailbox-pool-table" :class="{ 'mailbox-pool-table-empty': !result.items?.length }">
-          <colgroup v-if="result.items?.length"><col class="mailbox-col-id" /><col class="mailbox-col-email" /><col class="mailbox-col-label" /><col class="mailbox-col-status" /><col class="mailbox-col-channel" /><col class="mailbox-col-count" /><col class="mailbox-col-sync" /><col class="mailbox-col-actions" /></colgroup>
-          <thead><tr><th><label class="mailbox-select-all"><input type="checkbox" :checked="allPageMailboxesSelected" :indeterminate="somePageMailboxesSelected" :disabled="!result.items?.length" aria-label="全选当前页邮箱" @change="toggleAllMailboxSelection" /><span>ID</span></label></th><th>邮箱</th><th>标签 / 备注</th><th>状态</th><th>API / iCloud</th><th>收件</th><th>最近同步</th><th>操作</th></tr></thead>
+          <colgroup v-if="result.items?.length"><col class="mailbox-col-id" /><col class="mailbox-col-account" /><col class="mailbox-col-email" /><col class="mailbox-col-label" /><col class="mailbox-col-status" /><col class="mailbox-col-channel" /><col class="mailbox-col-count" /><col class="mailbox-col-sync" /><col class="mailbox-col-actions" /></colgroup>
+          <thead><tr><th><label class="mailbox-select-all"><input type="checkbox" :checked="allPageMailboxesSelected" :indeterminate="somePageMailboxesSelected" :disabled="!result.items?.length" aria-label="全选当前页邮箱" @change="toggleAllMailboxSelection" /><span>ID</span></label></th><th>Apple 账号</th><th>邮箱</th><th>标签 / 备注</th><th>状态</th><th>API / iCloud</th><th>收件</th><th>最近同步</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="mailbox in result.items" :key="mailbox.id" :class="{ 'mailbox-row-selected': isMailboxSelected(mailbox.id) }">
               <td class="mailbox-id-cell"><label class="mailbox-id-wrap"><input type="checkbox" :checked="isMailboxSelected(mailbox.id)" :disabled="isMailboxDeleteBusy(mailbox.id)" :aria-label="`选择邮箱 ${mailbox.email}`" @change="toggleMailboxSelection(mailbox)" /><span :title="mailbox.id">{{ mailbox.id }}</span></label></td>
+              <td class="mailbox-account-cell"><span :title="mailboxAppleAccount(mailbox)">{{ mailboxAppleAccount(mailbox) }}</span></td>
               <td class="mailbox-email-cell"><button type="button" class="mailbox-email-copy" :title="`点击复制邮箱：${mailbox.email}`" @click.stop="copyMailboxEmail(mailbox)">{{ mailbox.email }}</button></td>
               <td class="mailbox-label-cell"><span :title="mailbox.label || '—'">{{ mailbox.label || '—' }}</span><button type="button" :title="mailbox.note ? `点击修改备注：${mailbox.note}` : '点击添加备注'" @click.stop="openQuickEdit(mailbox, 'note')">{{ mailbox.note || '添加备注' }}</button></td>
               <td><button type="button" :class="statusClass(mailbox.status)" class="mailbox-status-button" title="点击修改邮箱状态" @click.stop="openQuickEdit(mailbox, 'status')">{{ statusLabel(mailbox.status) }}</button></td>
@@ -1093,7 +1198,7 @@ onBeforeUnmount(() => {
                 </div>
               </td>
             </tr>
-            <tr v-if="!loading && !result.items?.length" class="mailbox-empty-row"><td colspan="8" class="mailbox-empty-cell"><span><Boxes :size="20" /></span><strong>没有符合条件的邮箱</strong><small>从 Apple 账号页创建或同步隐私邮箱后会显示在这里。</small></td></tr>
+            <tr v-if="!loading && !result.items?.length" class="mailbox-empty-row"><td colspan="9" class="mailbox-empty-cell"><span><Boxes :size="20" /></span><strong>没有符合条件的邮箱</strong><small>从 Apple 账号页创建或同步隐私邮箱后会显示在这里。</small></td></tr>
           </tbody>
         </table>
       </div>
@@ -1170,7 +1275,7 @@ onBeforeUnmount(() => {
             <div class="mb-2.5 flex items-start justify-between gap-3"><h3 class="text-xs font-black text-slate-700 dark:text-slate-200">本地邮件 <span class="ml-1 text-slate-400">{{ messages.length }}</span></h3><span class="whitespace-nowrap text-[10px] text-slate-400">同步于 {{ formatTime(selected.last_sync_at) }}</span></div>
             <div v-if="!messages.length" class="mail-message-list flex items-center justify-center text-xs text-slate-400">暂无本地邮件</div>
             <div v-else class="mail-message-list">
-              <button v-for="item in messages" :key="item.id" type="button" class="mail-message-row" :title="`查看完整邮件：${item.subject || '无主题'}`" @click="selectedMessage = item">
+              <button v-for="item in messages" :key="item.id" type="button" class="mail-message-row" :title="`查看完整邮件：${item.subject || '无主题'}`" @click="openMessage(item)">
                 <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-100 text-sky-600 dark:bg-sky-950/50 dark:text-sky-300"><MailOpen :size="15" /></span>
                 <span class="min-w-0 flex-1 text-left"><strong class="block truncate text-xs">{{ item.subject || '无主题' }}</strong><small class="mt-0.5 block truncate text-[10px] text-slate-400">{{ item.from || '未知发件人' }}</small></span>
                 <span class="flex shrink-0 items-center gap-1.5"><time class="text-[9px] text-slate-400">{{ formatMessageTime(item.received_at) }}</time><ChevronRight :size="14" class="text-slate-300 dark:text-slate-600" /></span>
@@ -1233,11 +1338,18 @@ onBeforeUnmount(() => {
     <div v-if="selectedMessage" class="fixed inset-0 z-[60] !m-0 flex items-center justify-center bg-slate-950/65 p-3 backdrop-blur-[4px] sm:p-5" role="presentation" @click.stop>
       <article class="mail-message-dialog flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900" role="dialog" aria-modal="true" aria-labelledby="mail-message-title">
         <header class="flex items-start justify-between gap-4 border-b border-slate-200 px-4 py-3.5 dark:border-slate-700 sm:px-5">
-          <div class="min-w-0"><div class="mb-1.5 flex flex-wrap items-center gap-1.5"><span class="rounded-md bg-sky-100 px-2 py-0.5 text-[10px] font-bold text-sky-700 dark:bg-sky-950/60 dark:text-sky-200">完整邮件</span><span v-if="selectedMessage.source" class="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500 dark:bg-slate-800 dark:text-slate-300">{{ selectedMessage.source }}</span></div><h2 id="mail-message-title" class="break-words text-base font-black leading-6">{{ selectedMessage.subject || '无主题' }}</h2><p class="mt-1 break-all text-[11px] text-slate-400">{{ selectedMessage.from || '未知发件人' }}</p></div>
-          <button class="icon-button h-8 w-8 rounded-lg" title="关闭完整邮件" @click="selectedMessage = null"><X :size="17" /></button>
+          <div class="min-w-0"><div class="mb-1.5 flex flex-wrap items-center gap-1.5"><span class="rounded-md bg-sky-100 px-2 py-0.5 text-[10px] font-bold text-sky-700 dark:bg-sky-950/60 dark:text-sky-200">完整邮件</span><span v-if="selectedMessage.source" class="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500 dark:bg-slate-800 dark:text-slate-300">{{ selectedMessage.source }}</span><span class="rounded-md bg-violet-100 px-2 py-0.5 text-[10px] font-bold text-violet-700 dark:bg-violet-950/60 dark:text-violet-200">{{ messageContentTypeLabel(selectedMessage) }}</span></div><h2 id="mail-message-title" class="break-words text-base font-black leading-6">{{ selectedMessage.subject || '无主题' }}</h2><p class="mt-1 break-all text-[11px] text-slate-400">{{ selectedMessage.from || '未知发件人' }}</p></div>
+          <button class="icon-button h-8 w-8 rounded-lg" title="关闭完整邮件" @click="closeSelectedMessage"><X :size="17" /></button>
         </header>
-        <div class="flex items-center justify-between gap-3 border-b border-slate-100 bg-slate-50 px-4 py-2 text-[10px] text-slate-400 dark:border-slate-800 dark:bg-slate-950/50 sm:px-5"><span class="truncate">收件邮箱：{{ selected?.email }}</span><time class="shrink-0">{{ formatTime(selectedMessage.received_at) }}</time></div>
-        <div class="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5"><div class="min-h-40 whitespace-pre-wrap break-words rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-6 text-slate-700 dark:border-slate-700 dark:bg-slate-950/50 dark:text-slate-300">{{ selectedMessage.body || '这封邮件没有正文内容。' }}</div></div>
+        <div class="mail-message-meta flex items-center justify-between gap-3 border-b border-slate-100 bg-slate-50 px-4 py-2 text-[10px] text-slate-400 dark:border-slate-800 dark:bg-slate-950/50 sm:px-5">
+          <span class="truncate">收件邮箱：{{ selected?.email }}</span>
+          <div class="flex shrink-0 items-center gap-3"><div v-if="selectedMessageHasHTML" class="mail-message-view-switch"><button type="button" :class="{ active: messageViewMode !== 'text' }" @click="messageViewMode = 'html'">邮件视图</button><button type="button" :class="{ active: messageViewMode === 'text' }" @click="messageViewMode = 'text'">纯文本</button></div><time>{{ formatTime(selectedMessage.received_at) }}</time></div>
+        </div>
+        <div class="mail-message-content relative min-h-0 flex-1 bg-slate-100 dark:bg-slate-950">
+          <div v-if="selectedMessageLoading" class="mail-message-loading"><LoaderCircle :size="23" class="animate-spin" /><span>正在加载完整邮件</span></div>
+          <iframe v-if="showSelectedMessageHTML" class="mail-message-document" :srcdoc="selectedMessageHTMLDocument" sandbox="allow-popups allow-popups-to-escape-sandbox" title="HTML 邮件正文"></iframe>
+          <pre v-else class="mail-message-plain">{{ selectedMessage.body || '这封邮件没有正文内容。' }}</pre>
+        </div>
       </article>
     </div>
   </div>

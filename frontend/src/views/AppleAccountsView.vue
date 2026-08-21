@@ -12,7 +12,7 @@ const busyActions = ref([])
 const showLogin = ref(false)
 const showIMAP = ref(false)
 const showCreate = ref(false)
-const showPassword = ref(false)
+const showPassword = ref(true)
 const showIMAPPassword = ref(false)
 const data = ref({ items: [], module_ready: true })
 const selected = ref(null)
@@ -95,14 +95,16 @@ function accountStatusClass(account) {
 function openLoginDialog() {
   showIMAP.value = false
   showCreate.value = false
-  showPassword.value = false
+  login.apple_id = selected.value?.apple_id || ''
+  login.password = selected.value?.password || ''
+  showPassword.value = true
   showLogin.value = true
 }
 
 function closeLoginDialog(force = false) {
   if (!force && (isBusy('login') || isBusy('2fa'))) return
   showLogin.value = false
-  showPassword.value = false
+  showPassword.value = true
   login.password = ''
   pending.id = ''
   pending.code = ''
@@ -138,7 +140,7 @@ async function load(options = {}) {
     data.value = await api('/api/apple-accounts')
     if (selected.value) {
       const current = data.value.items.find((item) => item.id === selected.value.id)
-      if (current) selected.value = current
+      if (current) selected.value = { ...current, password: selected.value.password || '' }
       else selected.value = null
     }
   } catch (err) {

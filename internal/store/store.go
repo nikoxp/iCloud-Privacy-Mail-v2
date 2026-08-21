@@ -89,6 +89,9 @@ func (s *Store) initializeDatabase() error {
 
 func normalizeCreateSettings(settings *domain.CreateSettings) {
 	defaults := domain.DefaultCreateSettings()
+	if settings.Mode != "once" && settings.Mode != "scheduled" {
+		settings.Mode = defaults.Mode
+	}
 	if strings.TrimSpace(settings.Label) == "" {
 		settings.Label = defaults.Label
 	}
@@ -366,6 +369,9 @@ func (s *Store) AppleAccounts() []domain.AppleAccount {
 	defer s.mu.RUnlock()
 	var out []domain.AppleAccount
 	_ = s.loadEntities("apple_accounts", `json_extract(data_json, '$.created_at') DESC`, &out)
+	for index := range out {
+		out[index].Password = ""
+	}
 	var sessions []domain.ICloudSession
 	if err := s.loadEntities("icloud_sessions", "", &sessions); err == nil {
 		byAccount := make(map[string]domain.ICloudSession, len(sessions))

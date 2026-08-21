@@ -357,7 +357,7 @@ func migrationV4() []string {
 }
 
 func (s *Store) encryptSensitiveRows() error {
-	for _, table := range []string{"mailboxes", "settings", "icloud_sessions"} {
+	for _, table := range []string{"apple_accounts", "mailboxes", "settings", "icloud_sessions"} {
 		rows, err := s.db.Query(`SELECT id, data_json FROM ` + table)
 		if err != nil {
 			return err
@@ -419,6 +419,8 @@ func (s *Store) unprotectJSON(table string, protected []byte) ([]byte, error) {
 func (s *Store) transformSecrets(table string, value any, encrypt bool) error {
 	keys := map[string]bool{}
 	switch table {
+	case "apple_accounts":
+		keys["password"] = true
 	case "mailboxes":
 		keys["api_token"] = true
 	case "settings":
@@ -571,7 +573,7 @@ func redactSecrets(value any) {
 	case map[string]any:
 		for key, child := range typed {
 			switch key {
-			case "api_token", "public_api_key", "password_hash", "value", "api_key", "data_access_token", "imap_app_password":
+			case "api_token", "public_api_key", "password", "password_hash", "value", "api_key", "data_access_token", "imap_app_password":
 				delete(typed, key)
 			default:
 				redactSecrets(child)

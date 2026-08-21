@@ -35,12 +35,14 @@ type ICloudRemoteMailbox struct {
 }
 
 type ICloudSyncedMessage struct {
-	RemoteID   string
-	UID        string
-	Subject    string
-	From       string
-	Body       string
-	ReceivedAt time.Time
+	RemoteID    string
+	UID         string
+	Subject     string
+	From        string
+	Body        string
+	HTMLBody    string
+	ContentType string
+	ReceivedAt  time.Time
 }
 
 type ICloudMailCleanupResult struct {
@@ -1682,27 +1684,40 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 		folderName := firstNonEmpty(cleanMailFolder(meta.Folder), folder.Name)
 		from := addressSummary(meta.From)
 		recipients := string(meta.To) + "\n" + string(meta.CC) + "\n" + string(meta.BCC)
-		bodyText := meta.Subject + "\n" + meta.Preview
-		partIDs := textPartIDs(meta.Parts)
-		if len(partIDs) > 0 {
-			detail, err := c.messageBody(ctx, session, folderName, uid, partIDs)
+		bodyText := meta.Preview
+		htmlBody := ""
+		textParts := mailTextParts(meta.Parts)
+		if len(textParts) > 0 {
+			detail, err := c.messageBody(ctx, session, folderName, uid, textParts)
 			if err != nil {
 				return messages, err
 			}
 			recipients += "\n" + detail.LongHeader
-			bodyText += "\n" + detail.Body
+			if strings.TrimSpace(detail.TextBody) != "" {
+				bodyText = detail.TextBody
+			}
+			htmlBody = detail.HTMLBody
 		}
 		matchedMailboxIDs := matchingMailboxIDs(recipients, aliases)
 		if len(matchedMailboxIDs) == 0 {
 			continue
 		}
+		if strings.TrimSpace(bodyText) == "" && strings.TrimSpace(htmlBody) != "" {
+			bodyText = normalizeMailBody(htmlBody)
+		}
+		contentType := "text/plain"
+		if strings.TrimSpace(htmlBody) != "" {
+			contentType = "text/html"
+		}
 		message := ICloudSyncedMessage{
-			RemoteID:   "icloud:" + folderName + ":" + uid,
-			UID:        uid,
-			Subject:    meta.Subject,
-			From:       from,
-			Body:       normalizeMailBody(bodyText),
-			ReceivedAt: receivedAt,
+			RemoteID:    "icloud:" + folderName + ":" + uid,
+			UID:         uid,
+			Subject:     meta.Subject,
+			From:        from,
+			Body:        strings.TrimSpace(bodyText),
+			HTMLBody:    strings.TrimSpace(htmlBody),
+			ContentType: contentType,
+			ReceivedAt:  receivedAt,
 		}
 		for _, mailboxID := range matchedMailboxIDs {
 			after := afterByMailbox[mailboxID]
@@ -1734,10 +1749,16 @@ func matchingMailboxIDs(recipients string, aliases map[string]string) []string {
 
 type mailMessageDetail struct {
 	LongHeader string
-	Body       string
+	TextBody   string
+	HTMLBody   string
 }
 
-func (c *ICloudClient) messageBody(ctx context.Context, session ICloudSession, folderName, uid string, partIDs []string) (mailMessageDetail, error) {
+type mailTextPart struct {
+	PartID      string
+	ContentType string
+}
+
+func (c *ICloudClient) messageBody(ctx context.Context, session ICloudSession, folderName, uid string, textParts []mailTextPart) (mailMessageDetail, error) {
 	var out struct {
 		LongHeader string `json:"longHeader"`
 		Parts      []struct {
@@ -1747,18 +1768,31 @@ func (c *ICloudClient) messageBody(ctx context.Context, session ICloudSession, f
 	}
 	body := map[string]any{
 		"uid":            uid,
-		"parts":          partIDs,
+		"parts":          mailTextPartIDs(textParts),
 		"dontMarkAsRead": true,
 		"sessionHeaders": mailSessionHeaders(folderName, false),
 	}
 	if err := c.callMail(ctx, session, "/mailws2/v1/message/get", body, "", &out); err != nil {
 		return mailMessageDetail{}, err
 	}
-	var parts []string
-	for _, part := range out.Parts {
-		parts = append(parts, part.Content)
+	contentTypes := make(map[string]string, len(textParts))
+	for _, part := range textParts {
+		contentTypes[part.PartID] = part.ContentType
 	}
-	return mailMessageDetail{LongHeader: out.LongHeader, Body: strings.Join(parts, "\n")}, nil
+	var textBodies []string
+	var htmlBodies []string
+	for index, part := range out.Parts {
+		contentType := contentTypes[part.GUID]
+		if contentType == "" && index < len(textParts) {
+			contentType = textParts[index].ContentType
+		}
+		if strings.Contains(strings.ToLower(contentType), "text/html") {
+			htmlBodies = append(htmlBodies, part.Content)
+		} else {
+			textBodies = append(textBodies, part.Content)
+		}
+	}
+	return mailMessageDetail{LongHeader: out.LongHeader, TextBody: strings.Join(textBodies, "\n"), HTMLBody: strings.Join(htmlBodies, "\n")}, nil
 }
 
 func (c *ICloudClient) MoveRemoteMessagesToTrash(ctx context.Context, session ICloudSession, remoteIDs []string) (ICloudMailCleanupResult, error) {
@@ -2607,22 +2641,30 @@ func mailSessionHeaders(folder string, reset bool) map[string]any {
 	return headers
 }
 
-func textPartIDs(parts []struct {
+func mailTextParts(parts []struct {
 	PartID      string `json:"partId"`
 	ContentType string `json:"contentType"`
 	IsAttach    bool   `json:"isAttach"`
 	FileName    string `json:"fileName"`
 	Disposition string `json:"disposition"`
-}) []string {
-	var ids []string
+}) []mailTextPart {
+	var out []mailTextPart
 	for _, part := range parts {
 		if part.PartID == "" || part.IsAttach || part.FileName != "" {
 			continue
 		}
 		contentType := strings.ToLower(part.ContentType)
 		if strings.Contains(contentType, "text/plain") || strings.Contains(contentType, "text/html") {
-			ids = append(ids, strings.TrimSpace(part.PartID))
+			out = append(out, mailTextPart{PartID: strings.TrimSpace(part.PartID), ContentType: strings.TrimSpace(part.ContentType)})
 		}
+	}
+	return out
+}
+
+func mailTextPartIDs(parts []mailTextPart) []string {
+	ids := make([]string, 0, len(parts))
+	for _, part := range parts {
+		ids = append(ids, part.PartID)
 	}
 	return ids
 }

@@ -41,7 +41,12 @@ func (s *Store) ICloudSessionByAccountID(accountID string) (domain.ICloudSession
 }
 
 func (s *Store) SaveICloudSession(session domain.ICloudSession) (domain.ICloudSession, error) {
-	return s.saveICloudSession(session, "info", "已更新 Apple 登录态", "已保存 Apple 登录态")
+	return s.saveICloudSession(session, "", "info", "已更新 Apple 登录态", "已保存 Apple 登录态")
+}
+
+// SaveICloudSessionWithPassword 在保存登录态时同步更新加密的 Apple ID 密码。
+func (s *Store) SaveICloudSessionWithPassword(session domain.ICloudSession, password string) (domain.ICloudSession, error) {
+	return s.saveICloudSession(session, password, "info", "已更新 Apple 登录态", "已保存 Apple 登录态")
 }
 
 func (s *Store) SaveICloudSessionWithEvent(session domain.ICloudSession, level, message string) (domain.ICloudSession, error) {
@@ -49,10 +54,10 @@ func (s *Store) SaveICloudSessionWithEvent(session domain.ICloudSession, level, 
 	if message == "" {
 		message = "已更新 Apple 登录态"
 	}
-	return s.saveICloudSession(session, level, message, message)
+	return s.saveICloudSession(session, "", level, message, message)
 }
 
-func (s *Store) saveICloudSession(session domain.ICloudSession, level, updateMessage, createMessage string) (domain.ICloudSession, error) {
+func (s *Store) saveICloudSession(session domain.ICloudSession, password, level, updateMessage, createMessage string) (domain.ICloudSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -114,6 +119,9 @@ func (s *Store) saveICloudSession(session domain.ICloudSession, level, updateMes
 	session.AccountID = accountID
 	account.OwnerID = firstNonEmpty(account.OwnerID, session.OwnerID)
 	account.AppleID = firstNonEmpty(session.AppleID, account.AppleID)
+	if strings.TrimSpace(password) != "" {
+		account.Password = password
+	}
 	if account.Label == "" {
 		account.Label = firstNonEmpty(account.AppleID, "Apple 账号")
 	}

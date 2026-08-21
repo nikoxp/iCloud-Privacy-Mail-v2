@@ -73,6 +73,7 @@ type AppleAccount struct {
 	OwnerID      string    `json:"owner_id,omitempty"`
 	Label        string    `json:"label"`
 	AppleID      string    `json:"apple_id"`
+	Password     string    `json:"password,omitempty"`
 	Status       string    `json:"status"`
 	ICloudStatus string    `json:"icloud_status"`
 	Note         string    `json:"note"`
@@ -122,16 +123,18 @@ type MailboxLease struct {
 }
 
 type Message struct {
-	ID         string    `json:"id"`
-	OwnerID    string    `json:"owner_id,omitempty"`
-	MailboxID  string    `json:"mailbox_id"`
-	RemoteID   string    `json:"remote_id,omitempty"`
-	Source     string    `json:"source,omitempty"`
-	Subject    string    `json:"subject"`
-	From       string    `json:"from"`
-	Body       string    `json:"body"`
-	ReceivedAt time.Time `json:"received_at"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID          string    `json:"id"`
+	OwnerID     string    `json:"owner_id,omitempty"`
+	MailboxID   string    `json:"mailbox_id"`
+	RemoteID    string    `json:"remote_id,omitempty"`
+	Source      string    `json:"source,omitempty"`
+	Subject     string    `json:"subject"`
+	From        string    `json:"from"`
+	Body        string    `json:"body"`
+	HTMLBody    string    `json:"html_body,omitempty"`
+	ContentType string    `json:"content_type,omitempty"`
+	ReceivedAt  time.Time `json:"received_at"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type RemoteMailbox struct {
@@ -162,6 +165,7 @@ type Settings struct {
 
 type CreateSettings struct {
 	OwnerID                            string    `json:"owner_id,omitempty"`
+	Mode                               string    `json:"mode,omitempty"`
 	Label                              string    `json:"label,omitempty"`
 	Note                               string    `json:"note,omitempty"`
 	AccountIDs                         []string  `json:"account_ids,omitempty"`
@@ -276,6 +280,7 @@ func DefaultSettings() Settings {
 
 func DefaultCreateSettings() CreateSettings {
 	return CreateSettings{
+		Mode:                               "once",
 		Label:                              "x",
 		CreateChannel:                      "auto",
 		SchedulerCreateChannel:             "auto",

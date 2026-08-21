@@ -1,12 +1,55 @@
 package store
 
 import (
+	"bytes"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"icloud-privacy-mail-v2/internal/domain"
 )
+
+func TestSaveICloudSessionWithPasswordEncryptsAndReturnsOnlyInDetail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.db")
+	state, err := Open(path)
+	if err != nil {
+		t.Fatalf("创建临时数据库失败：%v", err)
+	}
+
+	const password = "Apple-Password-123"
+	session, err := state.SaveICloudSessionWithPassword(domain.ICloudSession{AppleID: "saved@icloud.com"}, password)
+	if err != nil {
+		t.Fatalf("保存 Apple ID 密码失败：%v", err)
+	}
+	var raw []byte
+	if err := state.db.QueryRow(`SELECT data_json FROM apple_accounts WHERE id = ?`, session.AccountID).Scan(&raw); err != nil {
+		t.Fatalf("读取 Apple 账号密文失败：%v", err)
+	}
+	if bytes.Contains(raw, []byte(password)) || !bytes.Contains(raw, []byte(secretPrefix)) {
+		t.Fatalf("Apple ID 密码未加密保存：%s", raw)
+	}
+	detail, ok := state.FindAppleAccount(session.AccountID)
+	if !ok || detail.Password != password {
+		t.Fatalf("账号详情未返回已解密密码：%+v", detail)
+	}
+	items := state.AppleAccounts()
+	if len(items) != 1 || items[0].Password != "" {
+		t.Fatalf("账号列表不应返回 Apple ID 密码：%+v", items)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatalf("关闭数据库失败：%v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("重新打开数据库失败：%v", err)
+	}
+	defer reopened.Close()
+	detail, ok = reopened.FindAppleAccount(session.AccountID)
+	if !ok || detail.Password != password {
+		t.Fatalf("重启后 Apple ID 密码解密结果不正确：%+v", detail)
+	}
+}
 
 func TestSaveICloudSessionUpdatesExistingAppleAccountByAppleID(t *testing.T) {
 	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
