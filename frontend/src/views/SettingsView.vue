@@ -225,7 +225,7 @@ onBeforeUnmount(() => {
               <input v-model="form.enable_public_mailbox_api" class="detail-switch" type="checkbox" />
             </label>
             <label class="toggle-card">
-              <span><strong class="flex items-center gap-2"><KeyRound :size="15" />公共验证码页面</strong><small>允许外部用户在独立页面输入邮箱并获取验证码，不显示后台入口。</small></span>
+              <span><strong class="flex items-center gap-2"><KeyRound :size="15" />公共邮箱取码页面</strong><small>允许外部用户输入邮箱获取验证码、同步邮件并查看完整正文，不显示后台入口。</small></span>
               <input v-model="form.enable_public_code_page" class="detail-switch" type="checkbox" />
             </label>
           </div>
@@ -239,10 +239,10 @@ onBeforeUnmount(() => {
               <button type="button" class="secondary-button settings-key-generate" @click="generatePublicAPIKey"><Sparkles :size="14" />生成新 Key</button>
               <div class="settings-api-endpoints">
                 <span><em>POST</em><code>/api/v1/mailboxes/claim</code></span>
-                <span><code>/verification-code</code><a href="/verification-code" target="_blank" rel="noopener"><ExternalLink :size="12" />打开页面</a></span>
+                <span><code>/email-code</code><a href="/email-code" target="_blank" rel="noopener"><ExternalLink :size="12" />打开页面</a></span>
               </div>
             </div>
-            <p class="mt-2 text-[11px] leading-5 text-slate-400">生成或修改后点击“保存系统设置”立即生效；公共验证码页面不使用这个 Key。</p>
+            <p class="mt-2 text-[11px] leading-5 text-slate-400">生成或修改后点击“保存系统设置”立即生效；公共邮箱取码页面不使用这个 Key。</p>
           </div>
         </section>
         </div>

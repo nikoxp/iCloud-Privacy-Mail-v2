@@ -55,6 +55,12 @@ type CodeResult struct {
 	MessageID  string    `json:"message_id"`
 }
 
+type MessageContentBackfillResult struct {
+	Total   int
+	Updated int
+	Failed  int
+}
+
 type CodeQuery struct {
 	After         time.Time
 	Keyword       string
@@ -838,12 +844,132 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 			remoteID := firstNonEmpty(message.RemoteID, message.UID)
 			update.Messages = append(update.Messages, store.MailboxSyncMessage{
 				RemoteID: remoteID, Source: source, Subject: message.Subject, From: message.From,
-				Body: message.Body, ReceivedAt: message.ReceivedAt,
+				Body: message.Body, HTMLBody: message.HTMLBody, ContentType: message.ContentType, ReceivedAt: message.ReceivedAt,
 			})
 		}
 		updates = append(updates, update)
 	}
 	return s.store.ApplyMailboxSyncBatch(updates)
+}
+
+// MessageContent 返回本地完整邮件；旧 IMAP 缓存缺少 HTML 时会按 UID 自动补全。
+func (s *Service) MessageContent(ctx context.Context, mailboxID, messageID string) (domain.Message, error) {
+	mailbox, ok := s.store.FindMailboxByID(mailboxID)
+	if !ok {
+		return domain.Message{}, errors.New("邮箱不存在")
+	}
+	message, ok := s.store.FindMessageForMailbox(mailbox.ID, messageID)
+	if !ok {
+		return domain.Message{}, errors.New("邮件不存在")
+	}
+	if strings.TrimSpace(message.HTMLBody) != "" || strings.TrimSpace(message.ContentType) != "" {
+		return message, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(message.Source), "imap") {
+		return message, nil
+	}
+	uid := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(message.RemoteID), "imap:"))
+	if uid == "" || uid == message.RemoteID {
+		return message, nil
+	}
+	session, ok := s.store.ICloudSessionByAccountID(mailbox.AccountID)
+	if !ok {
+		return domain.Message{}, errors.New("对应 Apple 账号登录态不存在")
+	}
+	imapState, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
+	if !ok {
+		return message, nil
+	}
+	fetched, err := protocol.FetchICloudIMAPMessageByUID(ctx, imapState, uid)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	return s.store.UpdateMessageContent(mailbox.ID, message.ID, fetched.Body, fetched.HTMLBody, fetched.ContentType)
+}
+
+// BackfillMessageContent 批量补全旧 IMAP 邮件的 HTML 与纯文本正文。
+func (s *Service) BackfillMessageContent(ctx context.Context) (MessageContentBackfillResult, error) {
+	missing := s.store.MessagesMissingContent(0)
+	result := MessageContentBackfillResult{Total: len(missing)}
+	if len(missing) == 0 {
+		return result, nil
+	}
+	mailboxes := make(map[string]domain.Mailbox)
+	for _, mailbox := range s.store.AllMailboxes() {
+		mailboxes[mailbox.ID] = mailbox
+	}
+	type target struct {
+		message domain.Message
+		mailbox domain.Mailbox
+	}
+	groups := make(map[string][]target)
+	order := make([]string, 0)
+	for _, message := range missing {
+		mailbox, ok := mailboxes[message.MailboxID]
+		if !ok || strings.TrimSpace(mailbox.AccountID) == "" {
+			continue
+		}
+		if _, exists := groups[mailbox.AccountID]; !exists {
+			order = append(order, mailbox.AccountID)
+		}
+		groups[mailbox.AccountID] = append(groups[mailbox.AccountID], target{message: message, mailbox: mailbox})
+	}
+	var failures []string
+	for _, accountID := range order {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		session, ok := s.store.ICloudSessionByAccountID(accountID)
+		if !ok {
+			failures = append(failures, accountID+"：Apple 账号登录态不存在")
+			continue
+		}
+		imapState, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
+		if !ok {
+			failures = append(failures, accountID+"：IMAP 取码登录不存在")
+			continue
+		}
+		uidTargets := make(map[string][]target)
+		uidOrder := make([]string, 0)
+		for _, item := range groups[accountID] {
+			uid := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(item.message.RemoteID), "imap:"))
+			if uid == "" || uid == item.message.RemoteID {
+				continue
+			}
+			if _, exists := uidTargets[uid]; !exists {
+				uidOrder = append(uidOrder, uid)
+			}
+			uidTargets[uid] = append(uidTargets[uid], item)
+		}
+		fetched, fetchErr := protocol.FetchICloudIMAPMessagesByUID(ctx, imapState, uidOrder)
+		updates := make([]store.MessageContentUpdate, 0, len(groups[accountID]))
+		for uid, items := range uidTargets {
+			message, ok := fetched[uid]
+			if !ok {
+				continue
+			}
+			for _, item := range items {
+				updates = append(updates, store.MessageContentUpdate{MailboxID: item.mailbox.ID, MessageID: item.message.ID, Body: message.Body, HTMLBody: message.HTMLBody, ContentType: message.ContentType})
+			}
+		}
+		updated, updateErr := s.store.ApplyMessageContentUpdates(updates)
+		result.Updated += updated
+		if fetchErr != nil {
+			failures = append(failures, accountID+"："+fetchErr.Error())
+		}
+		if updateErr != nil {
+			failures = append(failures, accountID+"："+updateErr.Error())
+		}
+	}
+	result.Failed = len(s.store.MessagesMissingContent(0))
+	if result.Failed > result.Total {
+		result.Failed = result.Total
+	}
+	result.Updated = result.Total - result.Failed
+	if len(failures) > 0 {
+		return result, errors.New(strings.Join(failures, "；"))
+	}
+	return result, nil
 }
 
 func (s *Service) Code(ctx context.Context, mailboxID string, after time.Time, keyword string, allowStale bool) (CodeResult, error) {
@@ -889,11 +1015,23 @@ func (s *Service) findCode(mailbox domain.Mailbox, query CodeQuery) (CodeResult,
 	if keyword == "" {
 		keyword = "OpenAI"
 	}
-	after := codeAfter(query.After, time.Now())
 	skipMessageID := strings.TrimSpace(query.SkipMessageID)
 	if query.IncludeServed {
 		skipMessageID = ""
 	}
+	after := query.After
+	if skipMessageID != "" {
+		if servedMessage, ok := s.store.FindMessageForMailbox(mailbox.ID, skipMessageID); ok {
+			servedAt := servedMessage.ReceivedAt
+			if servedAt.IsZero() {
+				servedAt = servedMessage.CreatedAt
+			}
+			if !servedAt.IsZero() && !servedAt.Before(after) {
+				after = servedAt.Add(time.Nanosecond)
+			}
+		}
+	}
+	after = codeAfter(after, time.Now())
 	for _, message := range s.store.MessagesForMailbox(mailbox.ID) {
 		messageTime := message.ReceivedAt
 		if messageTime.IsZero() {

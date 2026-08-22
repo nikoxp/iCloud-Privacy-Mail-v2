@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"icloud-privacy-mail-v2/internal/config"
@@ -15,11 +16,18 @@ import (
 )
 
 type Service struct {
-	cfg       config.Config
-	store     *store.Store
-	auth      *protocol.AuthFacade
-	client    *protocol.ICloudClient
-	validator *protocol.ICloudSessionValidator
+	cfg              config.Config
+	store            *store.Store
+	auth             *protocol.AuthFacade
+	client           *protocol.ICloudClient
+	validator        *protocol.ICloudSessionValidator
+	pendingMu        sync.Mutex
+	pendingPasswords map[string]pendingPassword
+}
+
+type pendingPassword struct {
+	value     string
+	expiresAt time.Time
 }
 
 type LoginRequest struct {
@@ -55,11 +63,12 @@ type AccountSummary struct {
 
 func NewService(cfg config.Config, state *store.Store) *Service {
 	return &Service{
-		cfg:       cfg,
-		store:     state,
-		auth:      protocol.NewAuthFacade(),
-		client:    protocol.NewICloudClient(),
-		validator: protocol.NewICloudSessionValidator(),
+		cfg:              cfg,
+		store:            state,
+		auth:             protocol.NewAuthFacade(),
+		client:           protocol.NewICloudClient(),
+		validator:        protocol.NewICloudSessionValidator(),
+		pendingPasswords: make(map[string]pendingPassword),
 	}
 }
 
@@ -75,8 +84,10 @@ func (s *Service) StartLogin(ctx context.Context, request LoginRequest) (LoginRe
 		AppleID:   result.AppleID,
 		ExpiresAt: result.ExpiresAt,
 	}
-	if !result.Needs2FA {
-		saved, err := s.store.SaveICloudSession(result.Session)
+	if result.Needs2FA {
+		s.rememberPendingPassword(result.PendingID, request.Password, result.ExpiresAt)
+	} else {
+		saved, err := s.store.SaveICloudSessionWithPassword(result.Session, request.Password)
 		if err != nil {
 			return LoginResult{}, err
 		}
@@ -86,20 +97,56 @@ func (s *Service) StartLogin(ctx context.Context, request LoginRequest) (LoginRe
 }
 
 func (s *Service) Submit2FA(ctx context.Context, pendingID, code string, phoneNumber json.RawMessage) (LoginResult, error) {
+	password := s.pendingPassword(pendingID)
 	session, err := s.auth.Submit2FA(ctx, pendingID, code, phoneNumber)
 	if err != nil {
 		return LoginResult{}, err
 	}
-	saved, err := s.store.SaveICloudSession(session)
+	saved, err := s.store.SaveICloudSessionWithPassword(session, password)
 	if err != nil {
 		return LoginResult{}, err
 	}
+	s.forgetPendingPassword(pendingID)
 	return LoginResult{
 		Needs2FA: false,
 		Message:  "Apple 登录和 2FA 已完成",
 		AppleID:  saved.AppleID,
 		Account:  s.summaryForSession(saved),
 	}, nil
+}
+
+func (s *Service) rememberPendingPassword(pendingID, password string, expiresAt time.Time) {
+	pendingID = strings.TrimSpace(pendingID)
+	if pendingID == "" || strings.TrimSpace(password) == "" {
+		return
+	}
+	now := time.Now()
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	for id, item := range s.pendingPasswords {
+		if !item.expiresAt.IsZero() && now.After(item.expiresAt) {
+			delete(s.pendingPasswords, id)
+		}
+	}
+	s.pendingPasswords[pendingID] = pendingPassword{value: password, expiresAt: expiresAt}
+}
+
+func (s *Service) pendingPassword(pendingID string) string {
+	pendingID = strings.TrimSpace(pendingID)
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	item, ok := s.pendingPasswords[pendingID]
+	if !ok || (!item.expiresAt.IsZero() && time.Now().After(item.expiresAt)) {
+		delete(s.pendingPasswords, pendingID)
+		return ""
+	}
+	return item.value
+}
+
+func (s *Service) forgetPendingPassword(pendingID string) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	delete(s.pendingPasswords, strings.TrimSpace(pendingID))
 }
 
 func (s *Service) Accounts() []AccountSummary {
@@ -111,6 +158,7 @@ func (s *Service) Accounts() []AccountSummary {
 	}
 	out := make([]AccountSummary, 0, len(accounts))
 	for _, account := range accounts {
+		account.Password = ""
 		summary := AccountSummary{AppleAccount: account, LoginStates: []LoginStateSummary{}}
 		if session, ok := byAccount[account.ID]; ok {
 			summary.LoginStates = publicLoginStates(session)

@@ -299,7 +299,7 @@ func (s *Server) handlePublicCodePageStatus(w http.ResponseWriter, _ *http.Reque
 		"success": true,
 		"data": map[string]any{
 			"enabled": settings.EnablePublicCodePage,
-			"route":   "/verification-code",
+			"route":   "/email-code",
 		},
 	})
 }
@@ -315,10 +315,122 @@ func (s *Server) handlePublicCodePageLookup(w http.ResponseWriter, r *http.Reque
 	s.handlePublicMailboxCode(w, request)
 }
 
+func (s *Server) publicCodePageMailbox(w http.ResponseWriter, r *http.Request) (domain.Mailbox, bool) {
+	if !s.store.Settings().EnablePublicCodePage {
+		writeError(w, http.StatusForbidden, "public_code_page_disabled", "公共验证码页面尚未开启")
+		return domain.Mailbox{}, false
+	}
+	email := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("email")))
+	if email == "" || !strings.Contains(email, "@") {
+		writeError(w, http.StatusBadRequest, "invalid_email", "请输入完整的邮箱地址")
+		return domain.Mailbox{}, false
+	}
+	mailbox, ok := s.store.FindMailboxByEmail(email)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mailbox_not_found", "邮箱不存在")
+		return domain.Mailbox{}, false
+	}
+	if !mailbox.APIActive || mailbox.Status == domain.StatusDisabled {
+		writeError(w, http.StatusForbidden, "api_disabled", "邮箱 API 已停用")
+		return domain.Mailbox{}, false
+	}
+	if !mailbox.ICloudActive {
+		writeError(w, http.StatusForbidden, "icloud_inactive", "邮箱在 iCloud 中已停用")
+		return domain.Mailbox{}, false
+	}
+	return mailbox, true
+}
+
+func (s *Server) handlePublicCodePageMessages(w http.ResponseWriter, r *http.Request) {
+	mailbox, ok := s.publicCodePageMailbox(w, r)
+	if !ok {
+		return
+	}
+	var syncErr error
+	if parseBool(r.URL.Query().Get("sync")) {
+		s.watcher.Wake(mailbox.ID)
+		minInterval := time.Duration(s.cfg.PublicSyncMinIntervalMS) * time.Millisecond
+		if minInterval < 0 {
+			minInterval = 0
+		}
+		if mailbox.LastSyncAt.IsZero() || time.Since(mailbox.LastSyncAt) >= minInterval {
+			syncCtx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+			_, syncErr = s.mailbox.SyncMessages(syncCtx, mailbox.ID)
+			cancel()
+		}
+	}
+	items := s.store.MessagesForMailbox(mailbox.ID)
+	total := len(items)
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	summaries := make([]map[string]any, 0, len(items))
+	for _, message := range items {
+		summaries = append(summaries, publicMessageSummary(message))
+	}
+	refreshed, _ := s.store.FindMailboxByID(mailbox.ID)
+	data := map[string]any{"email": mailbox.Email, "items": summaries, "total": total}
+	if !refreshed.LastSyncAt.IsZero() {
+		data["last_sync_at"] = refreshed.LastSyncAt
+	}
+	if syncErr != nil {
+		data["sync_error"] = "同步邮件失败，当前显示本地已保存的邮件"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": data})
+}
+
+func (s *Server) handlePublicCodePageMessage(w http.ResponseWriter, r *http.Request) {
+	mailbox, ok := s.publicCodePageMailbox(w, r)
+	if !ok {
+		return
+	}
+	message, err := s.mailbox.MessageContent(r.Context(), mailbox.ID, r.PathValue("messageID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{
+		"message": publicMessageContent(message),
+	}})
+}
+
+func publicMessageSummary(message domain.Message) map[string]any {
+	return map[string]any{
+		"id":           message.ID,
+		"source":       message.Source,
+		"subject":      message.Subject,
+		"from":         message.From,
+		"content_type": message.ContentType,
+		"has_html":     strings.TrimSpace(message.HTMLBody) != "",
+		"received_at":  message.ReceivedAt,
+	}
+}
+
+func publicMessageContent(message domain.Message) map[string]any {
+	return map[string]any{
+		"id":           message.ID,
+		"source":       message.Source,
+		"subject":      message.Subject,
+		"from":         message.From,
+		"body":         message.Body,
+		"html_body":    message.HTMLBody,
+		"content_type": message.ContentType,
+		"received_at":  message.ReceivedAt,
+	}
+}
+
 func (s *Server) staleCachedCode(mailboxID string, query mailboxservice.CodeQuery) (mailboxservice.CodeResult, bool, error) {
-	query.IncludeServed = true
+	query.IncludeServed = false
 	query.MarkAsServed = false
-	query.SkipMessageID = ""
 	return s.mailbox.CachedCodeWithQuery(mailboxID, query)
 }
 

@@ -249,7 +249,7 @@ textarea.field {
 
 .mailbox-pool-table {
   width: 100%;
-  min-width: 1180px;
+  min-width: 1340px;
   border-collapse: collapse;
   table-layout: fixed;
   color: var(--app-text);
@@ -307,6 +307,10 @@ textarea.field {
 
 .mailbox-col-email {
   width: 205px;
+}
+
+.mailbox-col-account {
+  width: 160px;
 }
 
 .mailbox-col-label {
@@ -2758,9 +2762,130 @@ textarea.field {
   scrollbar-gutter: stable;
 }
 
+.public-code-message-list {
+  height: auto;
+  max-height: 466px;
+  min-height: 52px;
+}
+
+.public-code-message-list .mail-message-row {
+  min-height: 58px;
+  padding: 7px 10px;
+}
+
+.public-code-message-state {
+  min-height: 498px;
+}
+
+@media (max-width: 639px) {
+  .public-code-message-state {
+    min-height: 490px;
+  }
+}
+
 .mail-message-dialog {
-  width: min(640px, calc(100vw - 1.5rem));
-  height: min(680px, calc(100vh - 1.5rem));
+  width: min(920px, calc(100vw - 1.5rem));
+  height: min(760px, calc(100vh - 1.5rem));
+}
+
+.mail-message-meta {
+  min-height: 37px;
+}
+
+.mail-message-view-switch {
+  display: flex;
+  padding: 2px;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  background: #fff;
+}
+
+.mail-message-view-switch button {
+  min-width: 52px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 5px;
+  color: #94a3b8;
+  font-size: 9px;
+  font-weight: 650;
+  transition: color 150ms ease, background-color 150ms ease;
+}
+
+.mail-message-view-switch button.active {
+  color: #0369a1;
+  background: #e0f2fe;
+}
+
+.mail-message-content {
+  padding: 14px;
+}
+
+.mail-message-document,
+.mail-message-plain {
+  width: 100%;
+  height: 100%;
+  min-height: 240px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #dbe3ee;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.mail-message-document {
+  display: block;
+}
+
+.mail-message-plain {
+  padding: 20px;
+  color: #334155;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mail-message-loading {
+  position: absolute;
+  inset: 14px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border-radius: 12px;
+  color: #64748b;
+  background: rgb(255 255 255 / 0.88);
+  backdrop-filter: blur(3px);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.dark .mail-message-view-switch {
+  border-color: #334155;
+  background: #0f172a;
+}
+
+.dark .mail-message-view-switch button.active {
+  color: #bae6fd;
+  background: #0c4a6e;
+}
+
+.dark .mail-message-content {
+  background: #020617;
+}
+
+.dark .mail-message-plain {
+  border-color: #334155;
+  color: #cbd5e1;
+  background: #0f172a;
+}
+
+.dark .mail-message-loading {
+  color: #cbd5e1;
+  background: rgb(15 23 42 / 0.88);
 }
 
 .mail-message-row {
@@ -3590,7 +3715,25 @@ textarea.field {
 }
 
 .task-log-column {
-  width: 20%;
+  width: 16.6667%;
+}
+
+.task-event-account,
+.mailbox-account-cell > span {
+  display: block;
+  overflow: hidden;
+  color: var(--app-text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-event-account {
+  text-align: left;
+}
+
+.mailbox-account-cell {
+  text-align: center;
 }
 
 .task-event-badge {

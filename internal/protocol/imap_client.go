@@ -635,6 +635,96 @@ func SyncICloudIMAPMessages(ctx context.Context, state LoginState, mailboxes []M
 	return result.MessagesByMailbox, nil
 }
 
+// FetchICloudIMAPMessageByUID 按 UID 重新读取一封完整邮件，用于补全旧缓存中的 HTML 正文。
+func FetchICloudIMAPMessageByUID(ctx context.Context, state LoginState, uid string) (ICloudSyncedMessage, error) {
+	messages, err := FetchICloudIMAPMessagesByUID(ctx, state, []string{uid})
+	if err != nil {
+		return ICloudSyncedMessage{}, err
+	}
+	uid = strconv.Itoa(imapUIDNumber(uid))
+	message, ok := messages[uid]
+	if !ok {
+		return ICloudSyncedMessage{}, errCode("imap_message_not_found", "iCloud IMAP 中未找到这封邮件", true)
+	}
+	return message, nil
+}
+
+// FetchICloudIMAPMessagesByUID 复用一个 IMAP 连接批量读取完整邮件正文。
+func FetchICloudIMAPMessagesByUID(ctx context.Context, state LoginState, uids []string) (map[string]ICloudSyncedMessage, error) {
+	state, err := normalizeICloudIMAPState(state)
+	if err != nil {
+		return nil, err
+	}
+	uidNumbers := make([]int, 0, len(uids))
+	seen := map[int]bool{}
+	for _, uid := range uids {
+		uidNumber := imapUIDNumber(uid)
+		if uidNumber > 0 && !seen[uidNumber] {
+			seen[uidNumber] = true
+			uidNumbers = append(uidNumbers, uidNumber)
+		}
+	}
+	if len(uidNumbers) == 0 {
+		return nil, errCode("invalid_imap_uid", "邮件 UID 无效", false)
+	}
+	sortInts(uidNumbers)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	conn, err := dialICloudIMAPTLS(ctx, state.IMAPHost, state.IMAPPort)
+	if err != nil {
+		return nil, errCode("imap_connect_failed", "连接 iCloud IMAP 失败："+err.Error(), true)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
+
+	reader := bufio.NewReader(conn)
+	greeting, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(strings.ToUpper(greeting), "OK") {
+		if err != nil {
+			return nil, errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败："+err.Error(), true)
+		}
+		return nil, errCode("imap_greeting_failed", "iCloud IMAP 未就绪："+strings.TrimSpace(greeting), true)
+	}
+	loginLines, err := imapCommand(conn, reader, "A001", "LOGIN "+imapQuote(state.IMAPUsername)+" "+imapQuote(state.IMAPAppPassword))
+	if err != nil {
+		return nil, errCode("imap_login_failed", "iCloud IMAP 登录请求失败："+err.Error(), true)
+	}
+	if !imapTaggedOK(loginLines, "A001") {
+		return nil, errCode("imap_login_failed", "iCloud IMAP 登录失败，请确认 iCloud 邮箱账号和 App 专用密码："+imapResponseSummary(loginLines), false)
+	}
+	selectLines, err := imapCommand(conn, reader, "A002", "SELECT INBOX")
+	if err != nil {
+		return nil, errCode("imap_select_failed", "打开 iCloud 收件箱失败："+err.Error(), true)
+	}
+	if !imapTaggedOK(selectLines, "A002") {
+		return nil, errCode("imap_select_failed", "打开 iCloud 收件箱失败："+imapResponseSummary(selectLines), true)
+	}
+	out := make(map[string]ICloudSyncedMessage, len(uidNumbers))
+	for index, chunk := range chunkInts(uidNumbers, 8) {
+		tag := fmt.Sprintf("A%03d", index+3)
+		lines, literals, err := imapCommandWithLiterals(conn, reader, tag, "UID FETCH "+imapUIDSet(chunk)+" (UID BODY.PEEK[]<0.4194304>)")
+		if err != nil {
+			return out, errCode("imap_fetch_failed", "批量读取完整邮件失败："+err.Error(), true)
+		}
+		if !imapTaggedOK(lines, tag) {
+			return out, errCode("imap_fetch_failed", "批量读取完整邮件失败："+imapResponseSummary(lines), true)
+		}
+		fetchUIDs := imapFetchUIDs(lines)
+		for literalIndex, raw := range literals {
+			if literalIndex >= len(fetchUIDs) {
+				continue
+			}
+			uid := strconv.Itoa(fetchUIDs[literalIndex])
+			message, _, ok := parseICloudIMAPMessage(iCloudIMAPFetchedMessage{UID: uid, Raw: raw})
+			if ok {
+				out[uid] = message
+			}
+		}
+	}
+	_, _ = imapCommand(conn, reader, fmt.Sprintf("A%03d", len(chunkInts(uidNumbers, 8))+3), "LOGOUT")
+	return out, nil
+}
+
 func LatestICloudIMAPUID(ctx context.Context, state LoginState) (string, error) {
 	state, err := normalizeICloudIMAPState(state)
 	if err != nil {
@@ -894,7 +984,7 @@ func parseICloudIMAPMessage(item iCloudIMAPFetchedMessage) (ICloudSyncedMessage,
 	if err != nil {
 		return ICloudSyncedMessage{}, "", false
 	}
-	bodyBytes, _ := io.ReadAll(io.LimitReader(msg.Body, 1<<20))
+	bodyBytes, _ := io.ReadAll(io.LimitReader(msg.Body, 4<<20))
 	body := decodeICloudIMAPBody(msg.Header, bodyBytes)
 	subject := decodeMIMEHeader(msg.Header.Get("Subject"))
 	from := decodeMIMEHeader(msg.Header.Get("From"))
@@ -908,13 +998,23 @@ func parseICloudIMAPMessage(item iCloudIMAPFetchedMessage) (ICloudSyncedMessage,
 		remoteID += ":" + uid
 	}
 	recipients := imapHeaderText(msg.Header)
+	textBody := strings.TrimSpace(body.Text)
+	if textBody == "" && strings.TrimSpace(body.HTML) != "" {
+		textBody = normalizeMailBody(body.HTML)
+	}
+	contentType := "text/plain"
+	if strings.TrimSpace(body.HTML) != "" {
+		contentType = "text/html"
+	}
 	return ICloudSyncedMessage{
-		RemoteID:   remoteID,
-		UID:        uid,
-		Subject:    subject,
-		From:       from,
-		Body:       normalizeMailBody(subject + "\n" + body),
-		ReceivedAt: receivedAt,
+		RemoteID:    remoteID,
+		UID:         uid,
+		Subject:     subject,
+		From:        from,
+		Body:        textBody,
+		HTMLBody:    strings.TrimSpace(body.HTML),
+		ContentType: contentType,
+		ReceivedAt:  receivedAt,
 	}, recipients, true
 }
 
@@ -1043,7 +1143,12 @@ func decodeMIMEHeader(value string) string {
 	return strings.TrimSpace(decoded)
 }
 
-func decodeICloudIMAPBody(header mail.Header, body []byte) string {
+type iCloudIMAPDecodedBody struct {
+	Text string
+	HTML string
+}
+
+func decodeICloudIMAPBody(header mail.Header, body []byte) iCloudIMAPDecodedBody {
 	mediaType, params, err := mime.ParseMediaType(header.Get("Content-Type"))
 	if err != nil {
 		mediaType = strings.ToLower(strings.TrimSpace(header.Get("Content-Type")))
@@ -1052,27 +1157,41 @@ func decodeICloudIMAPBody(header mail.Header, body []byte) string {
 	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
 		boundary := params["boundary"]
 		if boundary == "" {
-			return string(decoded)
+			return iCloudIMAPDecodedBody{Text: string(decoded)}
 		}
 		reader := multipart.NewReader(bytes.NewReader(decoded), boundary)
-		var parts []string
+		var textParts []string
+		var htmlParts []string
 		for i := 0; i < 30; i++ {
 			part, err := reader.NextPart()
 			if err != nil {
 				break
 			}
-			partBody, _ := io.ReadAll(io.LimitReader(part, 1<<20))
-			text := decodeICloudIMAPBody(mail.Header(part.Header), partBody)
-			if strings.TrimSpace(text) != "" {
-				parts = append(parts, text)
+			partBody, _ := io.ReadAll(io.LimitReader(part, 4<<20))
+			content := decodeICloudIMAPBody(mail.Header(part.Header), partBody)
+			if strings.TrimSpace(content.Text) != "" {
+				textParts = append(textParts, content.Text)
+			}
+			if strings.TrimSpace(content.HTML) != "" {
+				htmlParts = append(htmlParts, content.HTML)
 			}
 		}
-		return strings.Join(parts, "\n")
+		return iCloudIMAPDecodedBody{Text: strings.Join(textParts, "\n"), HTML: strings.Join(htmlParts, "\n")}
+	}
+	switch strings.ToLower(mediaType) {
+	case "text/html":
+		return iCloudIMAPDecodedBody{HTML: string(decoded)}
+	case "message/rfc822":
+		nested, err := mail.ReadMessage(bytes.NewReader(decoded))
+		if err == nil {
+			nestedBody, _ := io.ReadAll(io.LimitReader(nested.Body, 4<<20))
+			return decodeICloudIMAPBody(nested.Header, nestedBody)
+		}
 	}
 	if strings.HasPrefix(strings.ToLower(mediaType), "text/") || mediaType == "" {
-		return string(decoded)
+		return iCloudIMAPDecodedBody{Text: string(decoded)}
 	}
-	return string(decoded)
+	return iCloudIMAPDecodedBody{}
 }
 
 func decodeICloudIMAPTransfer(encoding string, body []byte) []byte {

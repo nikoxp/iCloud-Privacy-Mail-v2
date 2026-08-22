@@ -645,7 +645,13 @@ func (c *AppleAuthClient) requestPhoneSecurityCode(ctx context.Context, session 
 		"phoneNumber": phone,
 		"mode":        "sms",
 	}
-	_, _, err = c.do(ctx, session, http.MethodPut, session.Endpoints.Auth+"/verify/phone", session.twoFactorHeaders(), body, nil, false)
+	status, data, err := c.doWithAllowedStatuses(ctx, session, http.MethodPut, session.Endpoints.Auth+"/verify/phone", session.twoFactorHeaders(), body, nil, false, http.StatusPreconditionFailed)
+	if status == http.StatusPreconditionFailed && err == nil {
+		// Apple 某些账号发送短信后返回 412，并附带 trustedPhoneNumbers；这代表验证码已触发，不是登录失败。
+		if !session.rememberTwoFactorPhoneNumber(data) {
+			return errCode("apple_phone_code_request_failed", "Apple 返回了 412，但未识别到受信任手机号信息，请重新发起登录", true)
+		}
+	}
 	return err
 }
 
@@ -754,9 +760,9 @@ func appleAccountPhoneNumberPayload(phoneNumber json.RawMessage, includeNonFTEU 
 	return phone, nil
 }
 
-func (s *appleAuthSession) rememberTwoFactorPhoneNumber(data []byte) {
-	if s == nil || len(bytes.TrimSpace(s.TwoFactorPhone)) > 0 {
-		return
+func (s *appleAuthSession) rememberTwoFactorPhoneNumber(data []byte) bool {
+	if s == nil {
+		return false
 	}
 	payload := extractAppleAppConfigJSON(data)
 	if len(payload) == 0 {
@@ -764,13 +770,15 @@ func (s *appleAuthSession) rememberTwoFactorPhoneNumber(data []byte) {
 	}
 	var root any
 	if err := json.Unmarshal(payload, &root); err != nil {
-		return
+		return false
 	}
 	if phone, ok := firstApplePhoneNumber(root, 0); ok {
 		if data, err := json.Marshal(phone); err == nil {
 			s.TwoFactorPhone = data
+			return true
 		}
 	}
+	return false
 }
 
 func extractAppleAppConfigJSON(data []byte) []byte {
@@ -928,6 +936,10 @@ func (c *AppleAuthClient) authWithTokenAndValidate(ctx context.Context, session 
 }
 
 func (c *AppleAuthClient) do(ctx context.Context, session *appleAuthSession, method, rawURL string, headers map[string]string, body any, out any, allow409 bool) (int, []byte, error) {
+	return c.doWithAllowedStatuses(ctx, session, method, rawURL, headers, body, out, allow409)
+}
+
+func (c *AppleAuthClient) doWithAllowedStatuses(ctx context.Context, session *appleAuthSession, method, rawURL string, headers map[string]string, body any, out any, allow409 bool, allowedStatuses ...int) (int, []byte, error) {
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -987,6 +999,11 @@ func (c *AppleAuthClient) do(ctx context.Context, session *appleAuthSession, met
 	}
 	if allow409 && resp.StatusCode == http.StatusConflict {
 		return resp.StatusCode, data, nil
+	}
+	for _, allowedStatus := range allowedStatuses {
+		if resp.StatusCode == allowedStatus {
+			return resp.StatusCode, data, nil
+		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return resp.StatusCode, nil, errCode("apple_protocol_http_error", fmt.Sprintf("Apple 协议 HTTP %d: %s", resp.StatusCode, trimForError(data)), true)

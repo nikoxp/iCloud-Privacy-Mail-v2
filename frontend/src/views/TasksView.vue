@@ -14,12 +14,15 @@ const showDefaults = ref(false)
 const scheduler = ref({ running: false, status: 'idle', events: [] })
 const accounts = ref([])
 const form = reactive({ mode: 'once', account_id: '', account_ids: [], label: '', note: '', create_channel: 'auto', interval_min_minutes: 60, interval_max_minutes: 60, account_interval_min_seconds: 5, account_interval_max_seconds: 5 })
-const defaultForm = reactive({ label: '', note: '', account_ids: [], create_channel: 'auto', scheduler_create_channel: 'auto', apple_account_two_factor_method: 'trusted_device', icloud_web_two_factor_method: 'trusted_device', scheduler_interval_min_minutes: 60, scheduler_interval_max_minutes: 60, scheduler_account_interval_min_seconds: 5, scheduler_account_interval_max_seconds: 5 })
+const defaultForm = reactive({ mode: 'once', label: '', note: '', account_ids: [], create_channel: 'auto', scheduler_create_channel: 'auto', apple_account_two_factor_method: 'trusted_device', icloud_web_two_factor_method: 'trusted_device', scheduler_interval_min_minutes: 60, scheduler_interval_max_minutes: 60, scheduler_account_interval_min_seconds: 5, scheduler_account_interval_max_seconds: 5 })
 const { success, error: showError } = useToast()
 const { confirm: confirmAction } = useConfirm()
 let schedulerRefreshTimer = 0
 let realtimeRefreshTimer = 0
 let realtimeUnsubscribe = () => {}
+let autoSaveTimer = 0
+let autoSaveVersion = 0
+let autoSavePending = false
 const pendingRealtimeResources = new Set()
 let schedulerRefreshPending = false
 let schedulerRefreshVersion = 0
@@ -30,6 +33,7 @@ let logResizeTimer = 0
 let logLayoutObserver
 
 const accountOptions = computed(() => accounts.value.map((account) => ({ value: account.id, label: `${account.label || account.apple_id}（${account.apple_id}）` })))
+const accountByID = computed(() => new Map(accounts.value.map((account) => [account.id, account])))
 const schedulerEvents = computed(() => [...(scheduler.value.events || [])].reverse())
 const displayedStatus = computed(() => {
   if (scheduler.value.running) return scheduler.value.status
@@ -97,10 +101,11 @@ function syncModeDefaults(mode) {
 }
 
 function applyDefaults() {
+  form.mode = defaultForm.mode === 'scheduled' ? 'scheduled' : 'once'
   const validAccountIDs = (defaultForm.account_ids || []).filter((id) => accounts.value.some((account) => account.id === id))
   const firstAccountID = validAccountIDs[0] || accounts.value[0]?.id || ''
   form.account_id = firstAccountID
-  form.account_ids = firstAccountID ? [firstAccountID] : []
+  form.account_ids = validAccountIDs.length ? [...validAccountIDs] : (firstAccountID ? [firstAccountID] : [])
   form.label = defaultForm.label || ''
   form.note = defaultForm.note || ''
   form.create_channel = form.mode === 'scheduled'
@@ -116,6 +121,7 @@ function assignDefaultSettings(settings = {}) {
   const displaySettings = { ...settings }
   if (String(displaySettings.label || '').trim().toLowerCase() === 'x') displaySettings.label = ''
   Object.assign(defaultForm, {
+    mode: 'once',
     label: '',
     note: '',
     account_ids: [],
@@ -133,6 +139,43 @@ function assignDefaultSettings(settings = {}) {
     scheduler_account_interval_min_seconds: Number(displaySettings.scheduler_account_interval_min_seconds || 5),
     scheduler_account_interval_max_seconds: Number(displaySettings.scheduler_account_interval_max_seconds || displaySettings.scheduler_account_interval_min_seconds || 5),
   })
+}
+
+function buildFormSettings() {
+  const accountIDs = form.mode === 'scheduled'
+    ? [...form.account_ids]
+    : (form.account_id ? [form.account_id] : [])
+  return {
+    ...defaultForm,
+    mode: form.mode,
+    label: form.label,
+    note: form.note,
+    account_ids: accountIDs,
+    ...(form.mode === 'scheduled'
+      ? { scheduler_create_channel: form.create_channel }
+      : { create_channel: form.create_channel }),
+  }
+}
+
+async function saveFormSettings(version) {
+  try {
+    const data = await api('/api/create-settings', { method: 'PUT', body: JSON.stringify(buildFormSettings()) })
+    if (version === autoSaveVersion && data.settings) assignDefaultSettings(data.settings)
+  } catch (err) {
+    if (version === autoSaveVersion) notify(`自动保存创建设置失败：${err.message}`, true)
+  }
+}
+
+function scheduleFormAutoSave() {
+  if (!initialized.value) return
+  autoSaveVersion += 1
+  const version = autoSaveVersion
+  autoSavePending = true
+  window.clearTimeout(autoSaveTimer)
+  autoSaveTimer = window.setTimeout(() => {
+    autoSavePending = false
+    void saveFormSettings(version)
+  }, 500)
 }
 
 function eventTypeText(type) {
@@ -197,6 +240,11 @@ async function copyEmail(value) {
   }
 }
 
+function eventAppleAccount(event) {
+  const account = accountByID.value.get(event?.account_id)
+  return account?.apple_id || account?.label || event?.account_id || '—'
+}
+
 async function load(options = {}) {
   const silent = Boolean(options.silent)
   if (!silent) loading.value = true
@@ -248,8 +296,12 @@ async function refreshScheduler() {
 
 async function saveDefaults() {
   busy.value = 'save-defaults'
+  autoSaveVersion += 1
+  autoSavePending = false
+  window.clearTimeout(autoSaveTimer)
   try {
-    const data = await api('/api/create-settings', { method: 'PUT', body: JSON.stringify(defaultForm) })
+    // 设置弹窗没有执行方式控件，保存时沿用当前页面选择，避免覆盖用户刚切换的模式。
+    const data = await api('/api/create-settings', { method: 'PUT', body: JSON.stringify({ ...defaultForm, mode: form.mode }) })
     assignDefaultSettings(data.settings)
     applyDefaults()
     showDefaults.value = false
@@ -344,6 +396,11 @@ onMounted(() => {
   window.addEventListener('resize', scheduleLogViewportHeight)
 })
 
+watch(
+  () => [form.mode, form.account_id, form.account_ids.join(','), form.create_channel, form.label, form.note],
+  scheduleFormAutoSave,
+)
+
 watch([loading, () => scheduler.value.last_error], async () => {
   await nextTick()
   scheduleLogViewportHeight()
@@ -353,6 +410,11 @@ onBeforeUnmount(() => {
   schedulerRefreshVersion++
   window.clearInterval(schedulerRefreshTimer)
   window.clearTimeout(realtimeRefreshTimer)
+  if (autoSavePending) {
+    window.clearTimeout(autoSaveTimer)
+    autoSavePending = false
+    void saveFormSettings(autoSaveVersion)
+  }
   pendingRealtimeResources.clear()
   realtimeUnsubscribe()
   window.clearTimeout(logResizeTimer)
@@ -414,17 +476,18 @@ onBeforeUnmount(() => {
         </div>
         <div ref="logViewport" class="task-log-viewport" :style="{ '--task-log-height': `${logViewportHeight}px`, '--task-log-empty-height': `${logEmptyHeight}px` }">
           <table class="task-log-table" :class="{ 'task-log-table-empty': !schedulerEvents.length }">
-            <colgroup><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /></colgroup>
-            <thead><tr><th>事件</th><th>邮箱</th><th>标签</th><th>详情</th><th>时间</th></tr></thead>
+            <colgroup><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /><col class="task-log-column" /></colgroup>
+            <thead><tr><th>Apple 账号</th><th>事件</th><th>邮箱</th><th>标签</th><th>详情</th><th>时间</th></tr></thead>
             <tbody>
               <tr v-for="event in schedulerEvents" :key="event.id">
+                <td><span class="task-event-account" :title="eventAppleAccount(event)">{{ eventAppleAccount(event) }}</span></td>
                 <td><span :class="eventTone(event.type)" class="task-event-badge"><CircleAlert v-if="event.type === 'failed'" :size="13" /><CheckCircle2 v-else :size="13" />{{ eventTypeText(event.type) }}</span></td>
                 <td><button v-if="event.email" type="button" class="task-event-email" title="点击复制邮箱" :aria-label="`复制邮箱 ${event.email}`" @click="copyEmail(event.email)">{{ event.email }}</button><span v-else class="task-event-email-empty">—</span></td>
                 <td><span v-if="event.label" class="task-event-label" :title="event.label">{{ event.label }}</span><span v-else class="task-event-label-empty">—</span></td>
                 <td><span class="task-event-message" :title="event.message">{{ event.message }}</span></td>
                 <td><time>{{ formatTime(event.at) }}</time></td>
               </tr>
-              <tr v-if="!schedulerEvents.length" class="task-log-empty-row"><td colspan="5" class="task-log-empty"><span class="task-empty-icon"><Clock3 :size="20" /></span><strong>暂无调度记录</strong><small>启动创建任务后，运行过程会显示在这里。</small></td></tr>
+              <tr v-if="!schedulerEvents.length" class="task-log-empty-row"><td colspan="6" class="task-log-empty"><span class="task-empty-icon"><Clock3 :size="20" /></span><strong>暂无调度记录</strong><small>启动创建任务后，运行过程会显示在这里。</small></td></tr>
             </tbody>
           </table>
         </div>

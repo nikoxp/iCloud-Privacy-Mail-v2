@@ -20,7 +20,7 @@ const router = createRouter({
   },
   routes: [
     { path: '/login', name: 'login', component: LoginView, meta: { public: true, title: '登录' } },
-    { path: '/verification-code', name: 'verification-code', component: PublicCodeView, meta: { public: true, title: '获取验证码' } },
+    { path: '/email-code', name: 'email-code', component: PublicCodeView, meta: { public: true, title: '邮箱取码' } },
     {
       path: '/',
       component: AppLayout,

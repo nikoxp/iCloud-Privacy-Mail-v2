@@ -128,6 +128,45 @@ func TestMailboxSyncBatchSkipsUnchangedWritesAndCollapsesChanges(t *testing.T) {
 	}
 }
 
+func TestMessageContentBackfillUpdatesExistingMessage(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	mailbox, _, err := state.UpsertMailboxFromRemote("account", domain.RemoteMailbox{Email: "html@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	created, err := state.ApplyMailboxSyncBatch([]MailboxSyncUpdate{{MailboxID: mailbox.ID, Messages: []MailboxSyncMessage{{RemoteID: "imap:42", Source: "imap", Subject: "验证码", Body: "旧正文", ReceivedAt: now}}}})
+	if err != nil || created != 1 {
+		t.Fatalf("保存初始邮件失败：created=%d err=%v", created, err)
+	}
+	if _, err := state.db.Exec(`UPDATE messages SET data_json = json_remove(data_json, '$.content_type')`); err != nil {
+		t.Fatalf("准备旧邮件数据失败：%v", err)
+	}
+	missing := state.MessagesMissingContent(0)
+	if len(missing) != 1 {
+		t.Fatalf("缺少正文类型的旧邮件数量不正确：%d", len(missing))
+	}
+	updated, err := state.ApplyMessageContentUpdates([]MessageContentUpdate{{MailboxID: mailbox.ID, MessageID: missing[0].ID, Body: "完整纯文本", HTMLBody: "<p>完整正文</p>", ContentType: "text/html"}})
+	if err != nil || updated != 1 {
+		t.Fatalf("补全已有邮件失败：updated=%d err=%v", updated, err)
+	}
+	messages := state.MessagesForMailbox(mailbox.ID)
+	if len(messages) != 1 || messages[0].Body != "完整纯文本" || messages[0].HTMLBody != "<p>完整正文</p>" || messages[0].ContentType != "text/html" {
+		t.Fatalf("邮件正文补全结果不正确：%+v", messages)
+	}
+	storedMailbox, _ := state.FindMailboxByID(mailbox.ID)
+	if storedMailbox.ReceiveCount != 1 {
+		t.Fatalf("补全正文不应重复增加收件数：%d", storedMailbox.ReceiveCount)
+	}
+	if remaining := state.MessagesMissingContent(0); len(remaining) != 0 {
+		t.Fatalf("补全后仍有缺少正文类型的邮件：%d", len(remaining))
+	}
+}
+
 func TestSQLiteUsesNativeMailboxPagination(t *testing.T) {
 	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
